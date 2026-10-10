@@ -11,8 +11,11 @@
 package panel
 
 import (
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"net/http"
+	"strings"
 )
 
 //go:embed index.html
@@ -52,35 +55,68 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 }
 
+// assetETag 计算资源内容指纹（sha256 前 8 字节 hex），用作 ETag。
+func assetETag(b []byte) string {
+	sum := sha256.Sum256(b)
+	return `"` + hex.EncodeToString(sum[:8]) + `"`
+}
+
+// 四个嵌入资源的内容指纹，进程启动时算一次（嵌入内容在运行期不变）。
+var (
+	indexETag    = assetETag(indexHTML)
+	appJSTag     = assetETag(appJS)
+	mobileCSSTag = assetETag(mobileCSS)
+	mobileJSTag  = assetETag(mobileJS)
+)
+
+// writeAsset 输出嵌入资源：安全头 + 内容指纹 ETag + Cache-Control: no-cache。
+//
+// 曾经这里只是裸的 w.Write，没有 ETag / Last-Modified / Cache-Control——浏览器
+// 按启发式规则自行缓存，换二进制后仍可能继续用旧的 app.js / index.html，表现成
+// "明明更新了却看不出变化"。no-cache 的语义是"可缓存，但每次使用前必须回源校验"：
+// 内容没变回 304（省掉重复传输），内容变了指纹就变，浏览器必然重新拉取。
+func writeAsset(w http.ResponseWriter, r *http.Request, contentType, etag string, body []byte) {
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "no-cache")
+	if etagMatch(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+// etagMatch 判断 If-None-Match 是否命中当前 ETag。
+// 该头可能是逗号分隔的列表，也可能带 W/ 弱校验前缀，两者都要认。
+func etagMatch(header, etag string) bool {
+	for _, part := range strings.Split(header, ",") {
+		part = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(part), "W/"))
+		if part == etag || part == "*" {
+			return true
+		}
+	}
+	return false
+}
+
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(indexHTML)
+	writeAsset(w, r, "text/html; charset=utf-8", indexETag, indexHTML)
 }
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
 func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(appJS)
+	writeAsset(w, r, "text/javascript; charset=utf-8", appJSTag, appJS)
 }
 
 // mobileStyle 输出手机端适配样式（同源样式表，CSP style-src 'self' 加载）。
 // 单独成文而非写进 index.html：上游频繁改 index.html，独立文件可避免同步上游时反复冲突。
 func (p *Panel) mobileStyle(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/css; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(mobileCSS)
+	writeAsset(w, r, "text/css; charset=utf-8", mobileCSSTag, mobileCSS)
 }
 
 // mobileScript 输出手机端联动逻辑（同源脚本，须在 app.js 之后加载）。
 func (p *Panel) mobileScript(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(mobileJS)
+	writeAsset(w, r, "text/javascript; charset=utf-8", mobileJSTag, mobileJS)
 }
