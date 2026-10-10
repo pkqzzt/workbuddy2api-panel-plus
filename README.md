@@ -250,6 +250,22 @@ curl -s http://localhost:7863/healthz
 > 镜像 tag 规则：`main` 分支推送 `latest` / `main` / `sha-xxxxxx`；打 `v*` tag 额外发布
 > `1.2.3` / `1.2` / `1` 语义化版本；PR 仅构建验证、不推送。
 
+> 🇨🇳 **国内网络拉取**：`ghcr.io` 直连通常很慢或不通，而 `/etc/docker/daemon.json` 里的
+> `registry-mirrors` **只对 Docker Hub（docker.io）生效，对 ghcr.io 无效**——配了它再拉 ghcr
+> 依然是直连，这是最常见的误解。GHCR 的正确做法是**换地址前缀**，把 `ghcr.io` 换成
+> `ghcr.nju.edu.cn`（南京大学开源镜像站，实测可拉到本仓库全部 tag）：
+>
+> ```bash
+> docker pull ghcr.nju.edu.cn/pkqzzt/workbuddy2api-panel-plus:latest
+> docker tag ghcr.nju.edu.cn/pkqzzt/workbuddy2api-panel-plus:latest \
+>   ghcr.io/pkqzzt/workbuddy2api-panel-plus:latest    # 之后按原命令 run（也可直接用镜像站地址）
+> ```
+>
+> 或者改走下面的 **Compose 方式本地构建**：那条路完全不碰 ghcr，只需要 Docker Hub 的
+> 基础镜像（`golang:1.23-alpine` / `alpine:3.20`），而 Docker Hub 正是 `registry-mirrors`
+> 能加速的（可用加速源见 [DockerHub 镜像源汇总](https://github.com/dongyubin/DockerHub)）。
+> 若机器上有代理，也可直接给 Docker 守护进程配代理，一劳永逸覆盖 ghcr 与 GitHub。
+
 ### 方式一：Docker Compose（推荐服务器部署）
 
 ```bash
