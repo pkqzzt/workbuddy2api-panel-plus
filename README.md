@@ -820,6 +820,44 @@ http://127.0.0.1:7863/panel/
 
 账号 / 数据通过 `docker-compose.yml` 卷挂载持久化：`./auths`、`./data`、`./config.json`。
 
+### 升级到新版本
+
+**数据与配置向后兼容，不需要迁移**：`auths/`、`data/state.json`、`data/usage.json`、`data/request-logs/` 的落盘格式都没变；`config.json` 新增的 `api_keys` 是可选字段，不配置时行为与旧版一致；新版会自动创建 `data/credit-history.json`（积分历史）与 `data/key-usage.json`（逐 Key 用量）。
+
+升级前备份一次（虽然用不上，但便宜）：
+
+```bash
+tar czf ~/wb2api-$(date +%F).tar.gz auths data config.json
+```
+
+**Compose 部署（本仓库源码构建）**
+
+```bash
+cd <项目目录>
+git remote set-url origin https://github.com/pkqzzt/workbuddy2api-panel-plus.git   # 从旧仓库换到本仓库
+git fetch origin && git pull --ff-only
+docker compose up -d --build        # 只重建镜像；./auths 与 ./data 是宿主目录，不受影响
+docker compose logs --tail=50 -f
+```
+
+**镜像部署（GHCR，免构建）**
+
+```bash
+# 先记下旧容器的挂载，确保新容器不漏参数
+docker inspect workbuddy2api --format '{{json .HostConfig.Binds}}'
+
+docker pull ghcr.io/pkqzzt/workbuddy2api-panel-plus:latest
+docker stop workbuddy2api && docker rm workbuddy2api
+docker run -d --name workbuddy2api --restart unless-stopped \
+  -p 7863:7863 -e TZ=Asia/Shanghai \
+  -v "$PWD/auths:/app/auths" -v "$PWD/data:/app/data" -v "$PWD/config.json:/app/config.json" \
+  ghcr.io/pkqzzt/workbuddy2api-panel-plus:latest
+```
+
+**回滚**：compose 走 `git checkout <升级前的 commit>` 后重新 `up -d --build`；镜像建议用固定 tag——CI 每次 push main 都会产出 `sha-xxxxxx`（如 `ghcr.io/pkqzzt/workbuddy2api-panel-plus:sha-6657b58`），升级前再 `docker image tag <当前镜像> wb2api:rollback` 留条后路。
+
+**升级后**：`/healthz` 与面板能正常起来即完成。多 API Key 需要在 `config.json` 里加 `api_keys`（面板「配置」页保存其他设置不会覆盖它），配好后在「用量 → API Key 用量」看每把钥匙的消耗。
+
 ### 工具脚本
 
 | 脚本 | 用途 |
