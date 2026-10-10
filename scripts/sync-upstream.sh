@@ -4,7 +4,7 @@
 #
 # 本仓库是 linguo2625469/workbuddy2api-panel 的增强分支：在它之上叠了三个 PR 的合并
 # 与自有功能（多 API Key、逐 Key 用量台账、国内构建修复、面板资源缓存修复等，
-# 逐文件清单见 docs/upstream-sync.md）。上游继续演进时用本脚本并入。
+# 逐文件清单见仓库根的 UPSTREAM-SYNC.md）。上游继续演进时用本脚本并入。
 #
 # 用法：
 #   scripts/sync-upstream.sh           # 检查 + 合并（有冲突会停下并给出指引）
@@ -76,7 +76,7 @@ else
   echo "⚠ 预演发现冲突，涉及文件："
   grep -E 'CONFLICT' "$MT_OUT" | sed 's/^/    /' || sed 's/^/    /' "$MT_OUT"
   echo
-  echo "  这些文件含本仓库的自有改动，保留策略见 docs/upstream-sync.md 的逐文件清单。"
+  echo "  这些文件含本仓库的自有改动，保留策略见 UPSTREAM-SYNC.md 的逐文件清单。"
   echo "  下面照常合并，冲突会留在工作区等你处理。"
   echo
 fi
@@ -93,7 +93,7 @@ else
   echo
   echo "  处理步骤："
   echo "    1. 编辑上面列出的文件，删掉 <<<<<<< / ======= / >>>>>>> 三个标记行"
-  echo "       保留策略见 docs/upstream-sync.md（自有功能一律保留，上游改动吸收非重叠部分）"
+  echo "       保留策略见 UPSTREAM-SYNC.md（自有功能一律保留，上游改动吸收非重叠部分）"
   echo "    2. git add <文件>"
   echo "    3. go build ./... && go test ./... -count=1"
   echo "    4. git commit --no-edit          # 完成这次合并"

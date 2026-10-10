@@ -45,3 +45,6 @@ docs/
 *.zip
 server.exe
 .DS_Store
+
+# 上游同步文档：维护者用，与 README.md 同样放行
+!UPSTREAM-SYNC.md
