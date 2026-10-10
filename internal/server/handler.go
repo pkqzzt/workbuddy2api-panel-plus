@@ -18,6 +18,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyusage"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -34,6 +35,12 @@ type Config struct {
 	Upstream  *upstream.Client
 	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
 	MaxRotate int    // 单请求最多换号次数，默认 3
+	// Keyring 多 API Key 匹配表（可选；nil = 回落单 APIKey 语义）。
+	// 与 Live 同时给出时 Live 优先（面板热改）。
+	Keyring *httpauth.Keyring
+	// KeyUsage 逐 API Key 用量台账（可选；nil = 不记）。
+	// 在 chatCompletions 出口记一次，与 stdout 流水行同源。
+	KeyUsage *keyusage.Recorder
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -83,6 +90,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 	}
 	return livecfg.Snapshot{
 		APIKey:           h.cfg.APIKey,
+		Keyring:          h.cfg.Keyring,
 		SoftCooldown:     h.cfg.SoftCooldown,
 		RecordClientInfo: h.cfg.RecordClientInfo,
 	}
@@ -170,8 +178,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		live := h.loadLive()
+		// 多 API Key：命中哪一把决定该请求的模型白名单与出口绑定。
+		// 未配置 api_keys（Keyring 为 nil）时完全回落单密钥语义，老配置零变化。
+		if live.Keyring != nil {
+			if spec, ok := live.Keyring.Match(r); ok {
+				next(w, r.WithContext(withKeySpec(r.Context(), spec)))
+				return
+			}
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return
+		}
+		if !httpauth.VerifyBearer(r, live.APIKey) {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return
+		}
+		// 单密钥部署同样要能回答"这把钥匙用了多少"：把身份一并交给下游统计。
+		// api_key 为空（不鉴权）时没有可归集的身份，不带 keySpec，用量台账跳过该请求。
+		if spec, ok := httpauth.SingleSpec(live.APIKey); ok {
+			next(w, r.WithContext(withKeySpec(r.Context(), spec)))
 			return
 		}
 		next(w, r)
@@ -550,6 +575,44 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
 	}
 	defer st.done()
+
+	// 多 API Key 的第二半：模型白名单与出口绑定。
+	// 白名单不命中 → 本地 400，不送上游、不消耗额度（这正是分 Key 的目的：
+	// 桌面客户端的后台请求偷偷调用付费模型时，在本机就被挡下）。
+	if spec, ok := keySpecFrom(r.Context()); ok {
+		// 逐 Key 用量在此登记：放在白名单判定之前，被拦下的请求也算该钥匙的一次真实
+		// 使用（计入失败数）——面板正是靠失败数看出"某把钥匙在尝试越权"。
+		if h.cfg.KeyUsage != nil {
+			defer func(s httpauth.KeySpec) {
+				outcome := st.outcome
+				if outcome == "" {
+					// 与 reqlog 事件同口径：outcome 为空时按状态码补默认语义。
+					if st.status >= 200 && st.status < 300 {
+						outcome = reqlog.OutcomeSuccess
+					} else {
+						outcome = reqlog.OutcomeHTTPError
+					}
+				}
+				ok := st.status >= 200 && st.status < 300 && outcome == reqlog.OutcomeSuccess
+				h.cfg.KeyUsage.Note(s.ID, s.Name, ok,
+					st.promptTokens, st.completionTokens, st.totalTokens, st.credit, st.hasCredit)
+			}(spec)
+		}
+		if !httpauth.MatchModel(spec.Models, bareModel) {
+			writeOpenAIError(w, http.StatusBadRequest, "model_not_allowed",
+				fmt.Sprintf("model %q is not allowed for this API key", bareModel))
+			st.status = http.StatusBadRequest
+			st.outcome = reqlog.OutcomeHTTPError
+			return
+		}
+		if spec.Realm != "" && spec.Realm != realm {
+			// 出口绑定：Key 决定走国内还是国际域（覆盖模型前缀里的 realm）。
+			realm = spec.Realm
+			if h.cfg.Upstream != nil {
+				modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
+			}
+		}
+	}
 
 	tried := map[string]bool{}
 	var lastErr error

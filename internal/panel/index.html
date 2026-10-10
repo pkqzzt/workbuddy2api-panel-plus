@@ -893,6 +893,29 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </table>
         </div>
       </div>
+
+      <div class="box">
+        <header>
+          <h3>API Key 用量 <span class="hint">按密钥逐把归集，台账只存指纹不存密钥原文</span></h3>
+          <span class="grow"></span>
+          <label class="sel-note">范围
+            <select id="kuDays" aria-label="统计范围">
+              <option value="1">今天</option>
+              <option value="7" selected>近 7 天</option>
+              <option value="30">近 30 天</option>
+              <option value="0">全部</option>
+            </select>
+          </label>
+          <span class="note" id="kuNote">—</span>
+        </header>
+        <div class="kpis k4" id="kuStats"></div>
+        <div class="tbl-wrap">
+          <table class="acc zebra">
+            <thead id="kuHead"></thead>
+            <tbody id="kuBody"></tbody>
+          </table>
+        </div>
+      </div>
     </section>
 
     <!-- 配置 -->

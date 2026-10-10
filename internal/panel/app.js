@@ -347,7 +347,7 @@ function go(v) {
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
-  if (v === 'usage') loadUsage();
+  if (v === 'usage') { loadUsage(); loadKeyUsage(); }
   if (v === 'packages') loadPackages();
   // 到期提醒卡片不再「打开账号池就自动查」：逐账号实时查上游，账号一多打开面板
   // 就卡死。数据只由卡片上的「检查」按钮显式触发；卡片初始隐藏。
@@ -2386,9 +2386,106 @@ async function loadUsage() {
   }
 }
 
-if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
+if ($('btnUsage')) $('btnUsage').onclick = () => { loadUsage(); loadKeyUsage(); };
 // 时间范围控件绑定：任何改动（预设切换 / 自定义起止）都重新拉一次用量。
 if ($('usRange')) trangeBind('usRange', loadUsage);
+
+/* ── API Key 用量（多密钥部署的配额观测）─────────────────────────────
+   数据来自 data/key-usage.json（逐密钥按天分桶），与上面「用量明细」不是同一个
+   台账：那个按 (账号, 模型) 分桶回答"额度去哪了"，这个按密钥回答"哪把钥匙用了
+   多少"。两者来源不同、不能互相推导，所以各自查询——这里用按天的 days 窗口，
+   不复用 usRange 的小时滚动控件（日粒度的桶回答不了"近 24 小时"）。 */
+let keyUsageData = null;
+
+// kuLabel 密钥的展示名：配置里的备注名优先，其次台账里记过的名字，
+// 都没有时按配置状态回落（单密钥模式就是那把顶层钥匙）。
+function kuLabel(row) {
+  const label = String((row && row.label) || '').trim();
+  if (label) return label;
+  return (row && row.configured) ? '默认密钥（未命名）' : '已从配置移除';
+}
+
+// kuScope 该密钥的授权范围。空范围 = 不限制，必须显式写出来——
+// "什么都能调"与"什么都调不了"在表格里是同一种空白，含义却相反。
+function kuScope(row) {
+  if (!row || !row.configured) return '配置中已移除，历史用量仍在';
+  const parts = [];
+  parts.push((row.models && row.models.length) ? row.models.join('、') : '不限模型');
+  if (row.realm) parts.push('出口 ' + row.realm);
+  return parts.join(' · ');
+}
+
+function renderKeyUsage(d) {
+  keyUsageData = d || {};
+  if (!$('kuBody')) return;
+  const rows = keyUsageData.entries || [];
+  const t = keyUsageData.totals || {};
+  const multi = !!keyUsageData.multi;
+  const reqs = Number(t.requests || 0);
+  const errs = Number(t.errors || 0);
+  const okRate = reqs ? ((reqs - errs) / reqs * 100).toFixed(1) + '%' : '—';
+
+  $('kuStats').innerHTML =
+    usKpi(fmtTok(reqs), '请求数', 'c-accent',
+      multi ? '已配置 ' + Number(keyUsageData.configured || 0) + ' 把密钥' : '单密钥模式') +
+    usKpi(fmtTok(t.total_tokens), '总 token', 'c-accent',
+      'prompt ' + fmtTok(t.prompt_tokens) + ' · completion ' + fmtTok(t.completion_tokens)) +
+    usKpi(fmtTok(errs), '失败请求', errs ? 'c-warn' : 'c-mute', '成功率 ' + okRate) +
+    usKpi(fmtCredit(t.credit), '扣除积分', 'c-soft', '仅统计上游回传 credit 的请求');
+
+  const days = Number(keyUsageData.days || 0);
+  const scope = days === 0 ? '全部保留窗口' : (days === 1 ? '今天' : '近 ' + days + ' 天');
+  let note = scope + ' · ' + rows.length + ' 把密钥';
+  if (multi) note += '（已配置 ' + Number(keyUsageData.configured || 0) + ' 把）';
+  if (Number(t.removed || 0)) note += ' · ' + t.removed + ' 把已从配置移除';
+  $('kuNote').textContent = note;
+  $('kuNote').title = note;
+
+  $('kuHead').innerHTML =
+    '<tr><th class="mark" aria-hidden="true"></th><th>密钥</th>' +
+    '<th class="num">请求</th><th class="num">失败</th>' +
+    '<th class="num">prompt</th><th class="num">completion</th><th class="num">合计 Token</th>' +
+    '<th class="num">积分</th><th class="num">活跃天</th><th>最近使用</th></tr>';
+
+  const empty = multi
+    ? '所选窗口内还没有请求记录；配置已生效，等第一笔流量。'
+    : '未配置 api_key（不鉴权）或所选窗口内还没有请求记录。';
+  $('kuBody').innerHTML = rows.map(row => '<tr>' +
+      '<td class="mark" aria-hidden="true"></td>' +
+      '<td><span class="nm">' + esc(kuLabel(row)) + '</span>' +
+        '<div class="note">' + esc(kuScope(row)) + '</div>' +
+        '<div class="note" title="密钥指纹（sha256 前 8 字节）：台账只存它，不存密钥原文">' +
+          esc(String(row.key_id || '')) + '</div></td>' +
+      '<td class="num">' + esc(fmtTok(row.requests)) + '</td>' +
+      '<td class="num">' + (Number(row.errors || 0)
+        ? '<span style="color:var(--warn)">' + esc(fmtTok(row.errors)) + '</span>' : '0') + '</td>' +
+      '<td class="num">' + esc(fmtTok(row.prompt_tokens)) + '</td>' +
+      '<td class="num">' + esc(fmtTok(row.completion_tokens)) + '</td>' +
+      '<td class="num">' + esc(fmtTok(row.total_tokens)) + '</td>' +
+      '<td class="num">' + (Number(row.credit_samples || 0)
+        ? esc(fmtCredit(row.credit)) : '<span class="muted">—</span>') + '</td>' +
+      '<td class="num">' + esc(String(row.active_days || 0)) + '</td>' +
+      '<td>' + esc(row.last_used ? fmtLocalDateTime(row.last_used) : '—') + '</td>' +
+    '</tr>').join('') ||
+    '<tr><td colspan="10" class="empty">' + esc(empty) + '</td></tr>';
+}
+
+async function loadKeyUsage() {
+  if (!$('kuBody')) return;
+  const days = $('kuDays') ? $('kuDays').value : '7';
+  try {
+    renderKeyUsage(await api('key_usage?days=' + encodeURIComponent(days)));
+  } catch (e) {
+    // 失败时把整块清干净：只清表格会留下上一次窗口的数字，看着像刷新成功。
+    keyUsageData = null;
+    $('kuStats').innerHTML = '';
+    $('kuHead').innerHTML = '';
+    $('kuNote').textContent = '—';
+    $('kuBody').innerHTML = '<tr><td colspan="10" class="empty">读取 API Key 用量失败：' + esc(e.message) + '</td></tr>';
+  }
+}
+
+if ($('kuDays')) $('kuDays').onchange = loadKeyUsage;
 
 /* ── 积分构成 ─────────────────────────────────────────────────────── */
 /* 一个账号的余额是若干积分包之和。包按来源命名（「国内运营裂变包」「拉新权益包」

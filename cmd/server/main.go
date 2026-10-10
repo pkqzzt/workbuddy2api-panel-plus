@@ -19,6 +19,8 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyusage"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -235,6 +237,7 @@ func main() {
 	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
 	live := livecfg.New(livecfg.Snapshot{
 		APIKey:               cfg.APIKey,
+		Keyring:              buildKeyring(cfg),
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
@@ -271,6 +274,15 @@ func main() {
 	up.SetCreditObserver(creditHist.Observe)
 	log.Printf("[credithist] 积分历史已启用: %s", stateSibling(cfg.StateFile, "credit-history.json"))
 
+	// 逐 API Key 用量台账：回答"哪把钥匙用了多少"。与 usage 的账号/模型维度正交，
+	// 因此另立文件（key-usage.json）；台账里只有密钥指纹与备注名，不落密钥原文。
+	// 单密钥部署同样记录（那也是一把钥匙），未配置 api_key 时不记。
+	keyUsagePath := stateSibling(cfg.StateFile, "key-usage.json")
+	keyUsage := keyusage.New(keyUsagePath)
+	keyUsage.Start()
+	defer keyUsage.Stop()
+	log.Printf("[keyusage] 逐 Key 用量台账已启用: %s (%s)", keyUsagePath, keyUsage.Describe())
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -295,6 +307,9 @@ func main() {
 		},
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
 		CreditHistory: creditHist,
+		// 多 API Key 匹配表与逐 Key 用量台账（面板列出已配置密钥的用量）。
+		Keyring:  buildKeyring(cfg),
+		KeyUsage: keyUsage,
 	})
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
@@ -306,6 +321,8 @@ func main() {
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		Keyring:      buildKeyring(cfg),
+		KeyUsage:     keyUsage,
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
@@ -492,6 +509,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
+		Keyring:              buildKeyring(newCfg),
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
@@ -546,6 +564,26 @@ func restartRequiredFields(c *Config) []string {
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	out = append(out, "server.read_timeout")
 	return out
+}
+
+// buildKeyring 把配置里的 api_keys 转成鉴权用的匹配表；未配置时返回 nil
+// （handler 据此回落单 api_key 语义）。
+func buildKeyring(cfg *Config) *httpauth.Keyring {
+	if cfg == nil || len(cfg.APIKeys) == 0 {
+		return nil
+	}
+	specs := make([]httpauth.KeySpec, 0, len(cfg.APIKeys))
+	for _, k := range cfg.APIKeys {
+		enabled := k.Enabled == nil || *k.Enabled
+		specs = append(specs, httpauth.KeySpec{
+			Key:     k.Key,
+			Name:    k.Name,
+			Models:  k.Models,
+			Realm:   k.Realm,
+			Enabled: enabled,
+		})
+	}
+	return httpauth.NewKeyring(specs)
 }
 
 // mergeConfigMaps 把 incoming 深合并进 cur（原地），返回 cur。

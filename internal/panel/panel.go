@@ -24,6 +24,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyusage"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
@@ -64,6 +65,12 @@ type Config struct {
 	// CreditHistory 积分变动账本（nil = 积分历史接口返回 501）。只读展示：
 	// 留痕由余额查询路径（upstream.Client 的余额观察者）写入。
 	CreditHistory *credithist.Ledger
+
+	// Keyring 多 API Key 匹配表（装配期静态值；热改以 Live 为准）。
+	// 用于「用量 → API Key 用量」把台账行对照回配置里的密钥（含零用量、备注名）。
+	Keyring *httpauth.Keyring
+	// KeyUsage 逐 API Key 用量台账（nil = key_usage 接口返回 501）。
+	KeyUsage *keyusage.Recorder
 
 	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
@@ -160,6 +167,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistory))
+	p.mux.HandleFunc("GET /panel/api/key_usage", p.withAuth(p.keyUsage))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))

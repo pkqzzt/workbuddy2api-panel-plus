@@ -355,7 +355,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `listen` | `:7863` | HTTP 监听地址 |
-| `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
+| `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置）。配置了 `api_keys` 后它退居面板/管理接口的后备密钥，不再放行 `/v1/*` |
+| `api_keys` | 空 | 多 API Key：每把钥匙各自限定可调用的模型与出口区域，见[多 API Key](#多-api-keyapi_keys) |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
@@ -400,6 +401,31 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `session_sticky.enabled` | `true` | 会话粘性路由开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
+
+### 多 API Key（`api_keys`）
+
+单密钥部署下所有客户端共用一把钥匙，任一客户端（尤其带后台请求的桌面客户端）都能调用任意模型并消耗额度。`api_keys` 让每个客户端/用途各拿一把，各自绑定允许的模型与出口区域——越权请求**在网关本地就被 400 挡掉**，不送上游、不消耗任何额度。
+
+```json
+"api_keys": [
+  {"key": "sk-codex-xxxx", "name": "Codex App", "models": ["gpt-6-astra", "gpt-5.6-sol"], "realm": "global"},
+  {"key": "sk-dsh-xxxx",   "name": "DSH",       "models": ["deepseek*", "glm-*"]},
+  {"key": "sk-phone-xxxx", "name": "手机端",     "models": []}
+]
+```
+
+| 字段 | 说明 |
+|---|---|
+| `key` | 密钥原文；启用中的条目为空会**启动报错**（避免"配了但永远匹配不上"的哑配置） |
+| `name` | 备注名，用于日志、面板与报错文案；可空 |
+| `models` | 允许的模型，支持 `*` / `?` 通配（大小写不敏感）；空数组 = 不限制 |
+| `realm` | 出口绑定 `cn` / `global`，覆盖模型名上的 `[realm:]` 前缀；留空 = 跟随请求 |
+| `enabled` | 缺省 `true`；`false` 时该条目不参与匹配 |
+
+- 匹配用 SHA-256 + `subtle.ConstantTimeCompare`，逐条比较不提前返回（不以时序区分"密钥存在"与"不存在"）；重复 key、合法 realm 之外的值启动即报错；
+- 未配置 `api_keys` 时**完全回落顶层单 `api_key` 语义**，老配置行为零变化；一旦配置，顶层 `api_key` 只作面板/管理接口的后备密钥；
+- `api_keys` 是**热生效**字段：面板保存配置即在线替换匹配表，无需重启（面板表单不编辑它，深合并会原样保留）；
+- 每把钥匙的用量见面板「用量 → API Key 用量」，台账落 `data/key-usage.json`，**只存密钥指纹（sha256 前 8 字节）与备注名，不存密钥原文**。
 
 ### 上游超时语义（三段各归其位）
 
@@ -633,7 +659,7 @@ http://127.0.0.1:7863/panel/
 | 视图 | 功能 |
 |---|---|
 | **账号池** | 统计条（账号总数 / 可用 / 冷却中 / 已禁用 / 积分剩余·总额 / 粘性会话）+ 账号表：健康色条与状态标签（可用 / 限流冷却 / 积分冷却 / 熔断 / 连败降权 / 已禁用）、积分量条、成功·失败计数、在途、最近一次用量（次数 / token / 延迟 / 速率）、最近成功时间；单号操作 签到 / 余额 / 任务 / 解冻 / 禁用 / 移除；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」；下方**模型锁池**表列出被上游按模型限流的模型（整池不可用 / 没号可用 / 部分限流）、可选与总数、锁定账号数、最早解锁与全池解锁倒计时、限流原因，无锁定时显示「所有模型均可选」 |
-| **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败尝试 / 平均延迟，含占比与吐字速率）+ **Token 时序图**（渐变堆叠柱、均值参考线、峰值标注、悬停看单桶明细）+ **用量明细**（按账号 / 按模型 / 按域切换，可按合计 Token / 请求数 / 失败数 / 平均延迟排序，含 prompt·completion 占比条）+ **积分扣除历史**（按账号 / 按模型，折算「积分 / 1M Token」） |
+| **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败尝试 / 平均延迟，含占比与吐字速率）+ **Token 时序图**（渐变堆叠柱、均值参考线、峰值标注、悬停看单桶明细）+ **用量明细**（按账号 / 按模型 / 按域切换，可按合计 Token / 请求数 / 失败数 / 平均延迟排序，含 prompt·completion 占比条）+ **积分扣除历史**（按账号 / 按模型，折算「积分 / 1M Token」）+ **API Key 用量**（按密钥逐把归集请求数 / 失败数 / prompt / completion / 合计 Token / 积分 / 活跃天 / 最近使用，可切今天 / 近 7 天 / 近 30 天 / 全部；配置里配了但没用过的密钥也占一行） |
 | **积分构成** | **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
 | **任务中心** | 成长任务队列：一键扫描全部账号待办 → 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询。详见 [任务中心](#-任务中心面板新视图) |
 | **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
@@ -679,7 +705,7 @@ http://127.0.0.1:7863/panel/
 
 | 分组 | 端点 |
 |---|---|
-| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
+| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET key_usage`（`days`，0 = 全部；逐 API Key 用量 + 配置对照）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
 | 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` |
