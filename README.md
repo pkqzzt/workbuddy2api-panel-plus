@@ -285,6 +285,14 @@ curl -s http://localhost:7863/healthz
 # {"healthy":0,"total":0,"service":"workbuddy2api"}
 ```
 
+> 🇨🇳 **国内构建**：Dockerfile 已默认用 `goproxy.cn` 拉 Go 依赖——直连 `proxy.golang.org` 会长时间挂住后超时，
+> 这是国内本地构建最常见的失败点，一般无需额外配置。基础镜像（`golang:1.23-alpine` / `alpine:3.20`）来自
+> Docker Hub，慢的话配 `registry-mirrors` 即可（见上节）。若 `apk add` 阶段也卡住，换 Alpine 镜像站：
+>
+> ```bash
+> APK_MIRROR=mirrors.tuna.tsinghua.edu.cn docker compose build
+> ```
+
 启动后打开 **`http://localhost:7863/panel/`**，用面板「添加账号」完成登录（见下节）。
 
 常用运维命令：

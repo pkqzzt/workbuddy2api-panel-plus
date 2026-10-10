@@ -1,6 +1,13 @@
 services:
   wb2api:
-    build: .
+    build:
+      context: .
+      args:
+        # 构建期国内/海外可分别用环境变量覆盖（不设则用 Dockerfile 默认值）：
+        #   GOPROXY=https://proxy.golang.org,direct docker compose build   # 海外
+        #   APK_MIRROR=mirrors.tuna.tsinghua.edu.cn docker compose build   # 国内 apk 换源
+        GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
+        APK_MIRROR: ${APK_MIRROR:-dl-cdn.alpinelinux.org}
     container_name: workbuddy2api
     restart: unless-stopped
     # 容器默认以 app 用户（uid 10001）运行。宿主机挂载目录属主不同会导致

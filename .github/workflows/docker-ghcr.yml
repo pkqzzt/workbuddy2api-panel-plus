@@ -77,6 +77,9 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # runner 在境外，走官方 Go 代理比 goproxy.cn 快
+          build-args: |
+            GOPROXY=https://proxy.golang.org,direct
           cache-from: type=gha
           cache-to: type=gha,mode=max
           # 关闭 provenance attestation：避免 ghcr 页面出现 unknown/unknown 架构条目

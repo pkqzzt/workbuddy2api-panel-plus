@@ -1,5 +1,11 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.23-alpine AS build
+# Go module 代理：默认 goproxy.cn（七牛公共代理）。国内直连 proxy.golang.org 会挂住——
+# 表现为 `go mod download` 长时间无输出后超时失败，是本地构建失败最常见的原因。
+# 海外构建想走官方源可覆盖：
+#   docker build --build-arg GOPROXY=https://proxy.golang.org,direct .
+ARG GOPROXY=https://goproxy.cn,direct
+ENV GOPROXY=${GOPROXY}
 WORKDIR /src
 COPY go.mod ./
 RUN go mod download
@@ -12,7 +18,11 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/serve
 
 FROM alpine:3.20
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
-RUN apk add --no-cache wget ca-certificates tzdata python3 bash \
+# apk 包源默认官方；国内拉包慢/超时可换镜像站：
+#   docker build --build-arg APK_MIRROR=mirrors.tuna.tsinghua.edu.cn .
+ARG APK_MIRROR=dl-cdn.alpinelinux.org
+RUN sed -i "s|dl-cdn.alpinelinux.org|${APK_MIRROR}|g" /etc/apk/repositories \
+ && apk add --no-cache wget ca-certificates tzdata python3 bash \
  && adduser -D -u 10001 app \
  && mkdir -p /app/auths /app/data \
  && chown -R app:app /app
