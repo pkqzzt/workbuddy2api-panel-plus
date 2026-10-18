@@ -201,7 +201,14 @@ func (h *Handler) tracedRequest(r *http.Request) bool {
 
 // isSearchPath 判断是否为搜索端点。
 func isSearchPath(path string) bool {
-	return path == "/v1/search/messages"
+	// 三个工具端点都要记账：/v1/search/messages 是 Anthropic Messages 形态，
+	// /v1/tools/search 与 /v1/tools/fetch 是 DeepSeek Search/Fetch API 形态。
+	// 漏记会让面板「请求记录」里看不到 DSH 的搜索/抓取流量，排查接入问题时成盲区。
+	switch path {
+	case "/v1/search/messages", "/v1/tools/search", "/v1/tools/fetch":
+		return true
+	}
+	return false
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
