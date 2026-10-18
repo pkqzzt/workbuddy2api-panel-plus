@@ -147,6 +147,8 @@ func NewHandler(cfg Config) *Handler {
 	// 联网搜索（Anthropic Messages 兼容形态，见 messages.go）。路径刻意不占用
 	// /v1/messages——那是 Anthropic 模型对话的标准路径，留给未来的 chat 转发。
 	h.mux.HandleFunc("POST /v1/search/messages", h.withAuth(h.messages))
+	// DeepSeek Search API 形态：DSH 内置搜索插件直连 {baseURL}/search（见 tools.go）。
+	h.mux.HandleFunc("POST /v1/tools/search", h.withAuth(h.toolsSearch))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
