@@ -149,6 +149,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/search/messages", h.withAuth(h.messages))
 	// DeepSeek Search API 形态：DSH 内置搜索插件直连 {baseURL}/search（见 tools.go）。
 	h.mux.HandleFunc("POST /v1/tools/search", h.withAuth(h.toolsSearch))
+	h.mux.HandleFunc("POST /v1/tools/fetch", h.withAuth(h.toolsFetch))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
