@@ -33,12 +33,19 @@ import (
 // ModelsDevURL models.dev 官方聚合 JSON 端点（唯一端点，见文件头逆向结论）。
 const ModelsDevURL = "https://models.dev/api.json"
 
-// modelsDevTimeout 单次拉取超时：兜底的兜底，不值得等（任务书 §2：如 5s）。
-const modelsDevTimeout = 5 * time.Second
+// modelsDevTimeout 单次拉取超时。
+//
+// 曾设 5s：而聚合文档本身约 4.7MB（见 modelsDevMaxBody 注释），在 100KB/s 级别的
+// 链路上需要 30s 以上才能下完 —— 结果是每次都超时、永远拿不到 doc，5 分钟冷却后
+// 再来一轮，形成持续数十至上百 KB/s 的入站流量（实测容器 eth0 入站 ~127KB/s）。
+// 拉取是异步 goroutine，不阻塞请求路径，放宽到 45s 的代价只是失败时多等一会儿。
+const modelsDevTimeout = 45 * time.Second
 
-// modelsDevFetchCooldown 拉取节流（进程级）：文档是全量聚合体，5min 内不重拉
-// （同模型 24h 负缓存之外的整体节流，防短窗反复打 models.dev）。
-const modelsDevFetchCooldown = 5 * time.Minute
+// modelsDevFetchCooldown 拉取节流（进程级）：文档是全量聚合体（~4.7MB），1h 内不重拉。
+//
+// 曾设 5min：配合 5s 的必然超时，等于每 5 分钟白拉一次几百 KB 后丢弃。模型元数据
+// 变更极慢，拉长到 1h 后平均带宽降到 ~1KB/s 量级，且不影响正缓存命中。
+const modelsDevFetchCooldown = 1 * time.Hour
 
 // modelsDevNegativeTTL 同模型负缓存：查不到的模型 24h 内不重查
 // （任务书 §2：如同模型 24h 内不重查，查不到的模型负缓存防反复打）。
@@ -62,7 +69,7 @@ const modelsDevNegativesSoftCap = 1024
 const modelsDevNegativesHardCap = 2 * modelsDevNegativesSoftCap
 
 // modelsDevMaxBody 拉取响应体上限（文档实测 ~4.7MB，留余量；防异常大响应拖死）。
-const modelsDevMaxBody = 32 << 20
+const modelsDevMaxBody = 6 << 20
 
 // modelsDevValueMax 值校验上限：context/output 超过 1e9 视为脏数据拒绝
 // （量级上限校验，任务书 §2 值校验；正数下界在 catalog 写入侧兜底）。
