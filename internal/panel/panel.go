@@ -271,9 +271,19 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
+// logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys），
+// limit 控制条数（默认 200，上限即环容量 500）。
+//
+// 面板每 5 秒轮询一次该接口。此前无条数上限、每次回全量 500 条，响应体可达
+// 数百 KB，形成持续的下行流量（实测面板停在「运行日志」视图时容器下行 ~100KB/s）。
 func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.Snapshot()})
+	limit := 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.SnapshotTail(limit)})
 }
 
 // requestMetrics 返回进程内请求指标、最近 100 条与归档状态。

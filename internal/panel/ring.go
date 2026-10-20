@@ -92,3 +92,21 @@ func (r *Ring) Snapshot() []LogEntry {
 	copy(out, r.entries)
 	return out
 }
+
+// SnapshotTail 返回缓冲内最近 n 条（n<=0 或超过容量时返回全部）。
+//
+// 面板「运行日志」视图每 5 秒轮询一次，全量返回 500 条会让单次响应达到数百 KB，
+// 折合持续数十 KB/s 的下行流量。按需截断显著降低轮询成本，而"最近 N 条"正是
+// 该视图的实际展示需求。
+func (r *Ring) SnapshotTail(n int) []LogEntry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n <= 0 || n >= len(r.entries) {
+		out := make([]LogEntry, len(r.entries))
+		copy(out, r.entries)
+		return out
+	}
+	out := make([]LogEntry, n)
+	copy(out, r.entries[len(r.entries)-n:])
+	return out
+}

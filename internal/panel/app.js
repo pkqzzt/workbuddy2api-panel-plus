@@ -784,7 +784,9 @@ async function loadLogs() {
   rq.set('limit', limit);
   try {
     const [d, metrics, requestRows, credit] = await Promise.all([
-      api('logs'),
+      // limit 必须带：不带时后端回全量 500 条，单次响应可达数百 KB，
+      // 而本视图每 5 秒轮询一次——那是持续数十 KB/s 的下行流量。
+      api('logs?limit=' + limit),
       api('request_metrics').catch(() => ({})),
       api('request_logs?' + rq.toString()).catch(() => ({ entries: [] })),
       api('credit_history?limit=' + creditLimitValue()).catch(() => null),
@@ -1290,9 +1292,16 @@ $('btnRefresh').onclick = async () => {
 };
 
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
+let lastLogsAt = 0;
 function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
-  else if (view === 'logs') loadLogs();
+  else if (view === 'logs') {
+    // 日志视图降频到 15 秒：loadLogs 一次并发拉 4 个接口（logs / metrics /
+    // request_logs / credit_history），5 秒轮询对"看日志"这个场景毫无必要，
+    // 却会产生持续的下行流量。
+    const now = Date.now();
+    if (now - lastLogsAt >= 15000) { lastLogsAt = now; loadLogs(); }
+  }
   else if (view === 'taskscenter') reattachQueueView();
 }
 function start() {
