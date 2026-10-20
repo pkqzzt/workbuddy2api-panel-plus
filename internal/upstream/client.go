@@ -1695,7 +1695,9 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	// 模型列表随上游产品线扩张会变大（原始 2MB 是早期规模的经验值）。
+	// 截断会导致 ModelsDev/模型表解析失败，放宽到 8MB 留足余量。
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		// 读失败 → 传输层错误：半截 body 不进解析（不罚号）。
 		return nil, fmt.Errorf("read body: %w", err)

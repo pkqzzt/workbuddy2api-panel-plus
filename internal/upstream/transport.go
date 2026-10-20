@@ -50,8 +50,11 @@ const (
 
 // maxIdleConns / maxIdleConnsPerHost 连接池容量（既有值，一并集中定义）。
 const (
-	maxIdleConns        = 100
-	maxIdleConnsPerHost = 20
+	// 上游实际只有 1 个 host（copilot.tencent.com），PerHost 才是有效约束。
+	// 原 100/20 在 max_in_flight=3 下本就够用，放宽到 200/50 是为高并发场景
+	// （多 Key + 多客户端）留余量，避免频繁建连握手拖慢长请求。
+	maxIdleConns        = 200
+	maxIdleConnsPerHost = 50
 )
 
 // newDialer 构造出站拨号器（DialContext 的 Timeout/KeepAlive 参数集中于此，
