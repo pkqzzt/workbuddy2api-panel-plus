@@ -106,6 +106,8 @@ func main() {
 	p.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
+	p.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback) // 裸名跨域回退（issue #135，默认关闭）
+	_ = p.SetScheduling(cfg.Pool.Strategy, cfg.Pool.AccountOrder)
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -167,7 +169,20 @@ func main() {
 	up.GlobalEnabled = cfg.Global.Enabled
 	up.ChatBaseGlobal = cfg.Global.ChatBase
 	up.BillingBaseGlobal = cfg.Global.BillingBase
+	applyCNChatBase(up, cfg)
 	auth.SetGlobalEnabled(cfg.Global.Enabled)
+	// DNS：Android 没有 /etc/resolv.conf，Go 的纯 Go 解析器会退回 127.0.0.1/::1，
+	// 于是查任何域名都变成"连本机 53 端口"（dial tcp: lookup copilot.tencent.com
+	// on [::1]:53: connection refused）。配了 dns_servers / WB2A_DNS 就显式指定。
+	if len(cfg.DNSServers) > 0 {
+		d := upstream.NewDNSDialer(cfg.DNSServers)
+		up.SetDNSDialer(d)
+		// 推送 webhook / Upstash 镜像等走 http.DefaultTransport，一并换掉
+		if t, ok := http.DefaultTransport.(*http.Transport); ok {
+			t.DialContext = d.DialContext
+		}
+		log.Printf("DNS: 出站解析用 %v（不走系统 /etc/resolv.conf）", cfg.DNSServers)
+	}
 	// model.json 本地缓存接线（context_length/max_output_tokens 四级查找链第 3 级）：
 	// 数据目录与 state.json 同风格（Docker volume 持久化路径）。首次缺失/损坏自动
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
@@ -228,6 +243,12 @@ func main() {
 	case cfg.BalanceRefreshInterval > 0:
 		log.Printf("余额后台刷新：每 %s（签到时点照常额外刷新）", cfg.BalanceRefreshInterval)
 	}
+	switch {
+	case !cfg.Schedule.TaskSweepEnabled:
+		log.Printf("任务补领清扫已禁用（schedule.task_sweep_enabled=false）")
+	case cfg.TaskSweepInterval > 0:
+		log.Printf("任务补领清扫：每 %s（补领已达标未领的成长任务奖励）", cfg.TaskSweepInterval)
+	}
 	if cfg.Schedule.IncludeDisabledInTasks {
 		log.Printf("保号任务覆盖禁用账号（schedule.include_disabled_in_tasks=true）：禁用号仍签到 / 活跃 / 保活 / 刷新余额，但不参与选号")
 	}
@@ -241,6 +262,7 @@ func main() {
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -314,6 +336,9 @@ func main() {
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
 	sch.SetGrowthHook(pn.RunGrowthQueueOnce)
+	// 清扫回调返回统计汇总（测试/日志可观测），调度器 hook 只要求 func()：
+	// 这里收掉返回值——汇总已由 panel 侧内部日志输出。
+	sch.SetTaskSweepHook(func() { pn.RunTaskSweepOnce() })
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
@@ -338,12 +363,16 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
+		// Live 为 nil 的裸用/测试路径。
+		ModelsHidden: cfg.Models.Hidden,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
+	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，
@@ -513,6 +542,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
@@ -524,6 +554,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
+	p.SetCrossDomainFallback(newCfg.Pool.CrossDomainFallback) // 裸名跨域回退热生效（issue #135）
+	_ = p.SetScheduling(newCfg.Pool.Strategy, newCfg.Pool.AccountOrder)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
@@ -533,9 +565,18 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled,
 		!newCfg.Schedule.GrowthEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 
 	return restartRequiredFields(newCfg), nil
+}
+
+// applyCNChatBase 把 config cn.chat_base 装配进上游 client；空则保留内置默认，
+// 老配置（无 cn 段）行为不变。
+func applyCNChatBase(up *upstream.Client, cfg *Config) {
+	if cfg.CN.ChatBase != "" {
+		up.ChatBaseCN = cfg.CN.ChatBase
+	}
 }
 
 // restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。
@@ -557,6 +598,8 @@ func restartRequiredFields(c *Config) []string {
 	// 之后不再读取——不在 livecfg 热快照里，也无法热改。此前漏列，导致面板改完
 	// 显示"已保存"却不提示需要重启，用户以为没生效（issue #102 附带发现 2）。
 	out = append(out, "upstream.user_agent")
+	// cn.chat_base 同样只在装配期写进 up.ChatBaseCN（请求路径并发读取，不做热改）。
+	out = append(out, "cn.chat_base")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}

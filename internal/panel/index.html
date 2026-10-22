@@ -203,6 +203,10 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .box > header select, .box > header input { width: auto; }
 .box > header h3 { white-space: nowrap; }
 .box .pad { padding: 17px; }
+/* 补偿活动行：昵称 / 状态标 / 截止倒计时 / 额度 / 领取按钮，单行紧凑排布。
+   沿用 .tag 体系染色（ok=已领、warn=待领、bad=临期、mute=中性信息）。 */
+.comp-row { display: flex; align-items: center; gap: 9px; padding: 7px 0; border-bottom: 1px solid var(--line-soft); }
+.comp-row:last-child { border-bottom: none; }
 
 /* ── 账号表（签名元素：健康色条 + 积分量条）───────────────────────── */
 .tbl-wrap { overflow-x: auto; }
@@ -236,6 +240,8 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 #taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
 .who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acc.md .who .nm { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.acc.md .who .nm .mid { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
@@ -275,6 +281,7 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .tag.warn { background: var(--warn-soft); color: var(--warn); }
 .tag.bad { background: var(--bad-soft); color: var(--bad); }
 .tag.mute { background: var(--surface-2); color: var(--ink-3); border: 1px solid var(--line); }
+.md-avail { flex: none; padding: 0 6px; font-size: 10.5px; line-height: 16px; }
 .rate-limits { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; min-width: 210px; }
 .rate-limit {
   display: flex; align-items: baseline; gap: 6px; padding: 4px 7px;
@@ -586,6 +593,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .exp-main .note { margin-top: 2px; font-size: 11px; color: var(--ink-3); }
   .exp-main.err { color: var(--bad); }
 
+  /* ── 账号备注（本机 localStorage，不写服务器）─────────────────────────
+     有备注时备注当主标识，原昵称 / uid8 以 .rm-ghost 浅色跟随。账号池、用量明细、
+     积分扣除三张表共用同一套渲染，保证同一账号在两个视图里显示一致。 */
+  .rm-ghost { color: var(--ink-3); font-weight: 400; margin-left: .35em; }
+  .rm-list { display: flex; flex-direction: column; gap: 9px; }
+  .rm-row { display: flex; align-items: center; gap: 10px; }
+  .rm-row .rm-who { flex: 0 0 168px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--ink-2); font-size: 12.5px; }
+  .rm-row input { flex: 1; }
+
 </style>
 <!-- 移动端适配：独立文件，必须在主 <style> 之后（@media 覆盖依赖层叠顺序） -->
 <link rel="stylesheet" href="mobile.css">
@@ -663,9 +680,26 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>积分到期提醒<span class="hint">按最近到期批次估算 · 日均需耗 = 批次剩余 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</span></h3>
           <span class="grow"></span>
           <span class="note" id="expNote"></span>
+          <button class="xs" id="btnExpFold" aria-expanded="true">收起</button>
           <button class="xs" id="btnExp">检查</button>
         </header>
-        <div class="pad"><div id="expList"></div></div>
+        <div class="pad" id="expPad"><div id="expList"></div></div>
+      </div>
+
+      <!-- 官方补偿活动（issue #189）：「模型服务异常额外补偿 N 积分」这类限时补偿在账号侧
+           可见，但网关原先只在每日签到后盲领一次，「没有 / 已领过 / 领取真失败」三态在
+           日志里同构，补偿带截止日时签到一停就静默过期。这里把它显式摆出来：截止倒计时 +
+           逐号领取 + 全部领取。无生效活动时整卡隐藏——隐藏的是卡片本身、且渲染不依赖用户
+           点它，故不构成 issue #137 那种「入口藏在自己隐藏卡片里」的死锁。 -->
+      <div class="box" id="compBox" hidden>
+        <header>
+          <h3>官方补偿<span class="hint">服务异常等限时补偿 · 查状态后按需领取 · 不占用每日签到</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="compNote"></span>
+          <button class="xs" id="btnCompRefresh">检查</button>
+          <button class="xs" id="btnCompClaimAll">全部领取</button>
+        </header>
+        <div class="pad"><div id="compList"></div></div>
       </div>
 
       <div class="box">
@@ -673,6 +707,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>账号池</h3>
           <span class="grow"></span>
           <span class="note" id="accNote"></span>
+          <button class="xs" id="btnRemarks">备注</button>
           <button class="xs" id="btnCheckinAll">全部签到</button>
           <button class="xs" id="btnTravelAll">旅行巡检</button>
           <button class="xs" id="btnActivityAll">活跃上报</button>
@@ -992,6 +1027,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <span class="hint">每日到点自动「扫描 + 执行全部待办」（Sequential 任务链零点解锁后自动推进，建议零点后）</span></label>
             </div>
             <div class="hr"></div>
+            <div class="grid2">
+              <div class="switch"><span class="lb">任务补领清扫</span>
+                <input type="checkbox" name="task_sweep_enabled" checked></div>
+              <label class="fld"><span class="lb">清扫间隔（分钟）</span>
+                <input name="task_sweep_minutes" type="number" min="1" placeholder="15"></label>
+            </div>
+            <div class="hint">周期扫描全部账号，把「进度已达标但尚未领奖」的成长任务补领掉（不含自动动作的口令任务也能领），并顺带接受未接受的任务。只发 accept / claim 两条<b>幂等</b>请求，不跑任何对话或上报行为，开销可忽略。<br>用途：真实对话点亮的任务不在自动动作白名单里，成长队列与「一键完成」都不会去领它——积分因此卡在半路上不去（#174）。</div>
+            <div class="hr"></div>
             <div class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
               <input type="checkbox" name="include_disabled_in_tasks"></div>
             <div class="hint">禁用只关选号：打开后已禁用的账号仍会签到 / 活跃上报 / 保活 / 刷新余额（依旧不参与选号）。适合「一次只放开一个账号、用禁用做流量开关」的轮换养号用法，默认关闭。<br>若只想让<b>单个</b>账号临时退出选号但保留保号，直接用账号行的「<b>暂停选号</b>」按钮（账号级，无需打开本开关）。</div>
@@ -1001,6 +1044,27 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="box">
           <header><h3>账号池与流量治理</h3></header>
           <div class="pad">
+            <div class="grid3">
+              <label class="fld"><span class="lb">国内版调度策略</span>
+                <select name="strategy_domestic">
+                  <option value="weighted_random">加权随机（默认）</option>
+                  <option value="round_robin">轮询</option>
+                  <option value="sequential_exhaust">顺序耗尽</option>
+                </select></label>
+              <label class="fld"><span class="lb">国际版调度策略</span>
+                <select name="strategy_international">
+                  <option value="weighted_random">加权随机（默认）</option>
+                  <option value="round_robin">轮询</option>
+                  <option value="sequential_exhaust">顺序耗尽</option>
+                </select></label>
+            </div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">国内版账号顺序（UID）</span>
+                <input name="domestic_account_order" placeholder="uid1, uid2, uid3"></label>
+              <label class="fld"><span class="lb">国际版账号顺序（UID）</span>
+                <input name="international_account_order" placeholder="uid1, uid2, uid3"></label>
+            </div>
+            <div class="hint">按地区独立热生效；未列出的账号按 UID 排序追加。指针按地区和模型分别保存。会话粘性、模型成本分层优先；有序策略等待冷却恢复，不提前试探。临时重试或在途占满不推进顺序耗尽的主账号。闲置与快过期积分权重仅用于加权随机。</div>
             <div class="grid3">
               <label class="fld"><span class="lb">单账号最大在途</span>
                 <input name="max_in_flight" type="number" min="0" placeholder="3">
@@ -1309,6 +1373,25 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <footer>
       <span class="grow"></span>
       <button class="primary" id="btnKey">进入</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 账号备注：只写本机 localStorage，不写回服务器；账号池与用量两个视图同步显示 -->
+<div class="veil" id="remarkVeil">
+  <div class="dlg" style="width:560px">
+    <header>
+      <h3>账号备注</h3>
+      <div class="hint">备注只存在本机浏览器（localStorage: wb2api.remarks.v1），不写回后端；账号池与用量页会同时显示「备注 + 原昵称」。留空即清除该账号备注。</div>
+    </header>
+    <div class="body">
+      <div class="rm-list" id="remarkBody"></div>
+    </div>
+    <footer>
+      <button class="danger" id="btnRemarkClear">清空全部</button>
+      <span class="grow"></span>
+      <button id="btnRemarkClose">关闭</button>
+      <button class="primary" id="btnRemarkSave">保存</button>
     </footer>
   </div>
 </div>

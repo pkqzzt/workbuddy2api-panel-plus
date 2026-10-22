@@ -217,7 +217,8 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("rate-limit formatting node test failed: %v\n%s", err, out)
 	}
-	const want = `{"rate":"预计 2026-09-28 16:00 解封（剩余 2时00分） · 网关最快 1时00分 后重试","unavailable":"预计 1时00分 后重试","unknown":"预计解封时间未知"}`
+	// issue #171 问题二：until < resetAt 时主文字双时刻明示、倒计时跟随 until。
+	const want = `{"rate":"网关 2026-09-28 15:00 起重试（剩余 1时00分） · 上游称 2026-09-28 16:00 恢复","unavailable":"预计 1时00分 后重试","unknown":"预计解封时间未知"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("rate-limit formatting=%s want %s", out, want)
 	}
@@ -447,6 +448,58 @@ process.stdout.write(JSON.stringify({
 		`"rateFree":0,"rateMissing":null}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("model filter=%s\nwant %s", out, want)
+	}
+}
+
+// Global 模型可用性标签：模型锁优先于最近请求；无本地证据时保持“待验证”，
+// 不能把上游目录里出现模型误判为当前账号有权限。
+func TestAppJSModelAvailability(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; model availability test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function mdAvailabilityOf');
+const end = src.indexOf('function mdRowHtml');
+if (start < 0 || end < 0) throw new Error('model availability helpers not found');
+const ctx = { esc: s => String(s) };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.mdAvailabilityOf=mdAvailabilityOf; this.mdAvailabilityTag=mdAvailabilityTag;', ctx);
+const model = id => ({ id });
+const state = (m, locks, recent) => ctx.mdAvailabilityOf(m, locks, recent).key;
+const success = [{ model: 'global:ok', status: 200, outcome: 'success', time: '2026-10-18T12:00:00Z' }];
+ctx.mdLocks = [{ realm: 'global', model: 'gpt-5.6-sol', state: 'locked', reason: '11158 model not allowed for account type' }];
+ctx.mdRecent = [];
+const deniedTag = ctx.mdAvailabilityTag(model('global:gpt-5.6-sol'));
+process.stdout.write(JSON.stringify({
+  cn: ctx.mdAvailabilityOf(model('cn:glm-5.3'), [], []),
+  unknown: state(model('global:unknown'), [], []),
+  denied: state(model('global:gpt-5.6-sol'), [{ realm: 'global', model: 'gpt-5.6-sol', state: 'locked', reason: '11158 model not allowed for account type' }], []),
+  missing: state(model('global:auto-chat'), [{ realm: 'global', model: 'auto-chat', state: 'locked', reason: '11102 service info not found' }], []),
+  partial: state(model('global:glm-5.3'), [{ realm: 'global', model: 'glm-5.3', state: 'partial', reason: '6004 model rate limit' }], []),
+  starved: state(model('global:glm-5.3'), [{ realm: 'global', model: 'glm-5.3', state: 'starved' }], []),
+  rate: state(model('global:glm-5.3'), [], [{ model: 'global:glm-5.3', status: 429 }]),
+  upstream: state(model('global:glm-5.3'), [], [{ model: 'global:glm-5.3', status: 503 }]),
+  ok: state(model('global:ok'), [], success),
+  deniedTag: deniedTag.includes('无权限') && deniedTag.includes('tag bad'),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "model-availability-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("model availability node test failed: %v\n%s", err, out)
+	}
+	const want = `{"cn":null,"unknown":"unknown","denied":"denied","missing":"missing","partial":"partial","starved":"starved","rate":"rate","upstream":"upstream","ok":"ok","deniedTag":true}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("model availability=%s want %s", out, want)
 	}
 }
 
@@ -966,6 +1019,157 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// TestAppJSExpirySnapshotMatchesLive 钉住「打开面板看到的」与「点检查后看到的」逐字节
+// 一致（issue：首页快照与检查用了两套到期口径）。
+//
+// 做法：给同一逻辑数据的两条形态——packages（检查）与 credits_expiry_buckets（overview
+// 快照）——分别渲染，比较 expList.innerHTML。相等意味着排序、日期、该批合计、日均
+// 需耗、7 天内合计、随后批次全部一致，而不是只对齐了某一个字段。
+func TestAppJSExpirySnapshotMatchesLive(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry parity test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function expBatches');
+const end = src.indexOf('async function loadExpiry');
+if (start < 0 || end < 0 || end < start) throw new Error('expiry region not found');
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', children: [], textContent: '', hidden: true });
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  fmtTok: v => String(v == null ? 0 : v),
+  $: id => (sinks[id] || mk(id)),
+  Date, Math, Number, String, Map, Array, Object, isNaN,
+  lastPackages: null, lastPackagesAt: 0,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderExpiry = renderExpiry; this.renderExpirySnapshot = renderExpirySnapshot;', ctx);
+const iso = n => {
+  const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
+  const p = x => String(x).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+};
+// 同一天多个包：检查侧是 3 + 100 + 80，快照侧已聚合成 180。
+const live = { accounts: [
+  { uid: 'a', nickname: '同日多批', packages: [
+    { end_time: iso(0) + 'T09:00:00', remain: 3 },
+    { end_time: iso(1) + 'T09:00:00', remain: 100 },
+    { end_time: iso(1) + 'T12:00:00', remain: 80 },
+    { end_time: iso(2) + 'T09:00:00', remain: 50 },
+  ] },
+  { uid: 'b', nickname: '远期', packages: [
+    { end_time: iso(16) + 'T22:25:00', remain: 1600 },
+    { end_time: iso(17) + 'T09:00:00', remain: 400 },
+  ] },
+  { uid: 'c', nickname: '无到期', packages: [] },
+  { uid: 'd', nickname: '明天', packages: [{ end_time: iso(1) + 'T10:00:00', remain: 77 }] },
+] };
+const snap = { accounts: [
+  { uid: 'b', nickname: '远期', credits_expiry_buckets: [
+    { date: iso(16), remain: 1600 },
+    { date: iso(17), remain: 400 },
+  ] },
+  { uid: 'a', nickname: '同日多批', credits_expiry_buckets: [
+    { date: iso(2), remain: 50 },
+    { date: iso(1), remain: 180 },
+    { date: iso(0), remain: 3 },
+  ] },
+  { uid: 'c', nickname: '无到期', credits_expiry_buckets: [] },
+  { uid: 'd', nickname: '明天', credits_expiry_buckets: [{ date: iso(1), remain: 77 }] },
+] };
+ctx.renderExpiry(live);
+const liveHTML = sinks['expList'].innerHTML;
+sinks['expList'].innerHTML = '';
+ctx.renderExpirySnapshot(snap);
+const snapHTML = sinks['expList'].innerHTML;
+process.stdout.write(JSON.stringify({
+  equal: liveHTML === snapHTML,
+  today: liveHTML.includes('今天到期'),
+  tomorrow: liveHTML.includes('明天到期'),
+  weekSum: liveHTML.includes('7 天内合计'),
+  len: liveHTML.length,
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "expparity-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry parity node test failed: %v\n%s", err, out)
+	}
+	const want = `{"equal":true,"today":true,"tomorrow":true,"weekSum":true,"len":`
+	got := strings.TrimSpace(string(out))
+	if !strings.HasPrefix(got, want) {
+		t.Fatalf("expiry parity=%s\nwant prefix %s（快照与检查必须逐字节一致）", got, want)
+	}
+}
+
+// TestAppJSExpirySnapshotNoteCadence 到期卡片必须如实标注数据节奏与年龄。
+// 界面本身 5 秒轮询一次 overview，但卡片数据只随余额后台刷新更新（默认每 5 分钟）；
+// 不标注的话，5 秒级的界面刷新会让人误以为数据也是 5 秒级新鲜。
+func TestAppJSExpirySnapshotNoteCadence(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry note test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+// 从 expBatches 切起：renderExpirySnapshot 的按日批次分支要调 renderExpiry，
+// 只切它自己会 ReferenceError。
+const start = src.indexOf('function expBatches');
+const end = src.indexOf('async function loadExpiry');
+if (start < 0 || end < 0 || end < start) throw new Error('expiry region not found');
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', children: [], textContent: '', hidden: true });
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  fmtTok: v => String(v == null ? 0 : v),
+  $: id => (sinks[id] || mk(id)),
+  Date, Math, Number, String, Map, Array, Object, isNaN,
+  lastPackages: null, lastPackagesAt: 0,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
+const refreshedAt = new Date(Date.now() - 3 * 60000).toISOString();
+ctx.renderExpirySnapshot({ accounts: [
+  { uid: 'a', nickname: 'n', credits_expiry_buckets: [{ date: '2099-01-01', remain: 1 }] },
+], balance_refresh_sec: 300, balance_refreshed_at: refreshedAt });
+const withCadence = sinks['expNote'].textContent;
+ctx.renderExpirySnapshot({ accounts: [
+  { uid: 'a', nickname: 'n', credits_expiry_buckets: [{ date: '2099-01-01', remain: 1 }] },
+] });
+const withoutCadence = sinks['expNote'].textContent;
+process.stdout.write(JSON.stringify({
+  cadence: withCadence.includes('每 5 分钟后台刷新') && withCadence.includes('3 分钟前更新'),
+  noCadence: withoutCadence.includes('未开启后台刷新'),
+  note: withCadence,
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "expnote-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry note node test failed: %v\n%s", err, out)
+	}
+	const want = `{"cadence":true,"noCadence":true,"note":`
+	if !strings.HasPrefix(strings.TrimSpace(string(out)), want) {
+		t.Fatalf("expiry note=%s\nwant prefix %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
 // TestPanelIndexExpiryBoxNotHidden 到期卡片在 HTML 骨架里不得带 hidden 属性（issue #137）。
 //
 // 与上一个用例互补：app.js 侧有 renderExpirySnapshot 兜底，HTML 侧若仍写死 hidden，
@@ -1059,6 +1263,195 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// 账号备注：键取 uid 前 8 位（与 renderUsageDim 账号维度、积分扣除表的 uid 前缀同源，
+// 三个表格因此能直接 join）；有备注时备注当主标识、原昵称作浅色虚体跟随；备注来自本机
+// 输入，必须转义后才能拼进 innerHTML。
+func TestAppJSRemarkName(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; remark name test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const escStart = src.indexOf('function esc(');
+const escEnd = src.indexOf('function ago(');
+const start = src.indexOf('function remarkKey(');
+const end = src.indexOf('function storeRemarks(');
+if (escStart < 0 || escEnd < 0) throw new Error('esc helpers not found');
+if (start < 0 || end < 0) throw new Error('remark helpers not found');
+const ctx = { String, RegExp, Number };
+vm.createContext(ctx);
+vm.runInContext(
+  src.slice(escStart, escEnd) + src.slice(start, end) +
+  '\nconst REM = {abcdef12: "JTOL", deadbeef: "<b>x</b>"};' +
+  '\nfunction remarksAll() { return REM; }' +
+  '\nthis.remarkKey=remarkKey; this.remarkName=remarkName;',
+  ctx
+);
+process.stdout.write(JSON.stringify({
+  key: ctx.remarkKey('ABCDEF1234567890'),
+  short: ctx.remarkKey('abc'),
+  empty: ctx.remarkKey(null),
+  remarked: ctx.remarkName('abcdef12', '张三'),
+  plain: ctx.remarkName('zzzzzzzz', '张三'),
+  escaped: ctx.remarkName('deadbeef', 'n'),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "remark-name-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("remark name node test failed: %v\n%s", err, out)
+	}
+	const want = `{"key":"ABCDEF12","short":"abc","empty":"","remarked":"JTOL<span class=\"rm-ghost\">张三</span>","plain":"张三","escaped":"&lt;b&gt;x&lt;/b&gt;<span class=\"rm-ghost\">n</span>"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("remark name=%s\nwant %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// 「积分到期提醒」折叠：默认展开（点「检查」就得能看到结果），用户收起一次后由
+// localStorage 记住、重载时恢复；折叠只切列表容器的 hidden，不影响卡片与「检查」。
+func TestAppJSExpiryFold(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry fold test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function expFolded(');
+const endMarker = 'applyExpFold();';
+const end = src.lastIndexOf(endMarker);
+if (start < 0 || end < 0) throw new Error('expiry fold helpers not found');
+const slice = src.slice(start, end + endMarker.length);
+function boot(stored) {
+  const ctx = {};
+  vm.createContext(ctx);
+  vm.runInContext(
+    "const LS_EXP_FOLD='wb2api.expfold.v1';" +
+    "const store=" + JSON.stringify(stored) + ";" +
+    "const pad={hidden:false};" +
+    "const btn={textContent:'',attrs:{},setAttribute:function(k,v){this.attrs[k]=v;}};" +
+    "function $(id){return id==='expPad'?pad:(id==='btnExpFold'?btn:null);}" +
+    "const localStorage={getItem:function(k){return (k in store)?store[k]:null;},setItem:function(k,v){store[k]=v;}};" +
+    slice +
+    "\nthis.state=function(){return {hidden:pad.hidden,text:btn.textContent,aria:btn.attrs['aria-expanded'],raw:store['wb2api.expfold.v1']||null};};" +
+    "\nthis.click=function(){btn.onclick();};",
+    ctx
+  );
+  return ctx;
+}
+const a = boot({});
+const fresh = a.state();
+a.click();
+const folded = a.state();
+a.click();
+const unfolded = a.state();
+const restored = boot({'wb2api.expfold.v1': '1'}).state();
+process.stdout.write(JSON.stringify({fresh: fresh, folded: folded, unfolded: unfolded, restored: restored}));`
+	f, err := os.CreateTemp(t.TempDir(), "expiry-fold-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry fold node test failed: %v\n%s", err, out)
+	}
+	const want = `{"fresh":{"hidden":false,"text":"收起","aria":"true","raw":null},"folded":{"hidden":true,"text":"展开","aria":"false","raw":"1"},"unfolded":{"hidden":false,"text":"收起","aria":"true","raw":"0"},"restored":{"hidden":true,"text":"展开","aria":"false","raw":"1"}}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("expiry fold=%s\nwant %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// 备注与折叠的接线齐备性：少一个 id 或漏一个 localStorage 键，表现为「按钮点了没反应」，
+// 而 Go 编译、JS 语法检查、顶层冒烟都发现不了（脚本能正常跑，只是挂不上）。
+func TestPanelRemarkAndFoldWiring(t *testing.T) {
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`id="btnRemarks"`, `id="remarkVeil"`, `id="remarkBody"`, `id="btnRemarkSave"`, `id="btnRemarkClear"`, `id="expPad"`, `id="btnExpFold"`} {
+		if !bytes.Contains(html, []byte(want)) {
+			t.Fatalf("index.html 缺少 %s", want)
+		}
+	}
+	// 折叠容器默认必须可见：列表一旦带上 hidden，点「检查」就看不到结果了。
+	for _, line := range strings.Split(string(html), "\n") {
+		if strings.Contains(line, `id="expPad"`) && strings.Contains(line, "hidden") {
+			t.Fatalf("index.html 的过期列表容器默认带 hidden：%s", strings.TrimSpace(line))
+		}
+	}
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"LS_REMARKS = 'wb2api.remarks.v1'",
+		"LS_EXP_FOLD = 'wb2api.expfold.v1'",
+		"function remarkKey(",
+		"function remarkName(",
+		"function applyExpFold(",
+	} {
+		if !bytes.Contains(js, []byte(want)) {
+			t.Fatalf("app.js 缺少 %s", want)
+		}
+	}
+}
+
+// 用实际表单函数验证地区策略回填、独立提交以及清空账号顺序。
+func TestRegionSchedulingFormRoundTrip(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available")
+	}
+	script := `const fs=require('fs'), vm=require('vm'), assert=require('assert');
+ const src=fs.readFileSync(process.argv[2],'utf8');
+ const html=fs.readFileSync('index.html','utf8');
+ const elements={};
+ for(const name of ['strategy_domestic','strategy_international','domestic_account_order','international_account_order']) {
+   assert(html.includes('name="'+name+'"'), 'missing form field '+name);
+   elements[name]={type:name.startsWith('strategy_')?'select-one':'text',value:''};
+ }
+ const cfg={pool:{strategy:{domestic:'round_robin',international:'sequential_exhaust'},account_order:{domestic:['c','a'],international:['y','x']}}};
+ const nodes={cfgForm:{elements},cfgPath:{},cfgNote:{}};
+ const ctx={cfgLoaded:null,api:async()=>({config:cfg}),$:id=>nodes[id],markDurationFields(){},toast(message){throw Error(message)}};
+ vm.createContext(ctx);
+ vm.runInContext(src.slice(src.indexOf('const CFG_MAP ='),src.indexOf('/* Go 时长字段即时校验')),ctx);
+ (async()=>{
+   await ctx.loadConfig();
+   assert.equal(elements.strategy_domestic.value,'round_robin');
+   assert.equal(elements.strategy_international.value,'sequential_exhaust');
+   assert.equal(elements.domestic_account_order.value,'c, a');
+   elements.strategy_domestic.value='weighted_random';
+   elements.international_account_order.value='';
+   const result=ctx.collectConfig();
+   assert.equal(result.pool.strategy.domestic,'weighted_random');
+   assert.equal(result.pool.strategy.international,'sequential_exhaust');
+   assert.equal(JSON.stringify(result.pool.account_order.domestic),'["c","a"]');
+   assert.equal(JSON.stringify(result.pool.account_order.international),'[]');
+   delete cfg.pool.strategy; await ctx.loadConfig();
+   assert.equal(elements.strategy_domestic.value,'weighted_random');
+   assert.equal(elements.strategy_international.value,'weighted_random');
+ })().catch(e=>{console.error(e);process.exitCode=1});`
+	fp := filepath.Join(t.TempDir(), "region-form.cjs")
+	if err = os.WriteFile(fp, []byte(script), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(node, fp, "app.js").CombinedOutput(); err != nil {
+		t.Fatalf("form round trip: %v\n%s", err, out)
+	}
+}
+
 // TestMobileJSChartTooltipInsideBar 手机端自绘图表的 tooltip 同样要挂在柱子内部（issue #128）。
 //
 // mobile.js 在窄屏另画一张图（440×230），不走 app.js 的 renderUsageChart：上游修好
@@ -1125,3 +1518,4 @@ process.stdout.write(JSON.stringify({
 			strings.TrimSpace(string(out)), want)
 	}
 }
+

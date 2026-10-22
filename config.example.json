@@ -4,6 +4,7 @@
   "api_keys": [],
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "dns_servers": [],
   "server": {
     "read_timeout": "300s"
   },
@@ -42,6 +43,9 @@
     "chat_base": "",
     "billing_base": ""
   },
+  "cn": {
+    "chat_base": ""
+  },
   "upstream": {
     "timeout_seconds": 120,
     "header_timeout_seconds": 120,
@@ -57,6 +61,10 @@
   "features": {
     "sanitize_blacklist_fingerprints": true
   },
+  "models": {
+    "_comment": "hidden: 不对外暴露的模型黑名单。裸名=两域都藏；\"cn:xxx\"/\"global:xxx\"=只藏该域。/v1/models 列表过滤 + chat 点名拒绝，面板保存后热生效。",
+    "hidden": []
+  },
   "prompt": {
     "mode": "passthrough",
     "file": ""
@@ -66,6 +74,14 @@
     "token": ""
   },
   "pool": {
+    "strategy": {
+      "domestic": "weighted_random",
+      "international": "weighted_random"
+    },
+    "account_order": {
+      "domestic": [],
+      "international": []
+    },
     "max_in_flight": 3,
     "max_in_flight_global": 2,
     "breaker_threshold": 3,
@@ -79,7 +95,8 @@
     "prefer_expiring": true,
     "expiring_soon": "168h",
     "cost_explore_interval": "30m",
-    "credit_floor": 100
+    "credit_floor": 100,
+    "cross_domain_fallback": false
   },
   "session_sticky": {
     "enabled": true,

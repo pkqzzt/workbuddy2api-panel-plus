@@ -60,6 +60,10 @@ type Pool struct {
 	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
 	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
 	preferExpiring bool
+	// crossDomainFallback 裸模型名跨域回退开关（默认 false = 零回归，issue #135）。
+	// 仅由选号调用方（server handler）读取：开启后，未带 realm 前缀的请求在首选域
+	// 选不到可用号时改用另一域再选一次；显式 cn:/global: 前缀不受影响。
+	crossDomainFallback bool
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
@@ -74,7 +78,10 @@ type Pool struct {
 	// pickSeq 单调递增的选号序号：每次 pick 选中账号时自增并记到 entry.usedSeq，
 	// 为 LRU 兜底/防惊群提供与 time.Now() 精度无关的严格全序（Windows ~0.5ms 精度下
 	// lastUsed 墙钟会全等）。仅 pick 写锁路径读写，无需 atomic。
-	pickSeq uint64
+	pickSeq      uint64
+	strategies   RegionStrategies
+	accountOrder RegionAccountOrder
+	scheduling   map[string]scheduleCursor
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh chan struct{}
@@ -86,6 +93,7 @@ type Pool struct {
 func New(stateFp string) *Pool {
 	p := &Pool{
 		byUID:              map[string]*entry{},
+		scheduling:         map[string]scheduleCursor{},
 		stateFp:            stateFp,
 		breakerThreshold:   defaultBreakerThreshold,
 		breakerCooldown:    defaultBreakerCooldown,
@@ -191,6 +199,21 @@ func (p *Pool) SetPreferExpiring(enabled bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.preferExpiring = enabled
+}
+
+// SetCrossDomainFallback 注入裸模型名跨域回退开关（issue #135；false = 零回归）。
+// 与其它 pool.* 参数一致，面板保存配置后经同一条热应用路径立即生效。
+func (p *Pool) SetCrossDomainFallback(enabled bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.crossDomainFallback = enabled
+}
+
+// CrossDomainFallback 报告裸模型名跨域回退开关当前状态（选号侧只读，热改安全）。
+func (p *Pool) CrossDomainFallback() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.crossDomainFallback
 }
 
 // SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。

@@ -1,6 +1,9 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
+/* 账号备注与「积分到期提醒」折叠的本机键（同上：模块级声明放顶部，避开 TDZ）。 */
+const LS_REMARKS = 'wb2api.remarks.v1', LS_EXP_FOLD = 'wb2api.expfold.v1';
+let remarksCache = null;
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
@@ -9,6 +12,7 @@ let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
+let mdLocks = [], mdRecent = [];
 let reqFilter = { q: '', outcome: '' };
 let reqEntries = [];
 let usDim = 'account', usCreditDim = 'account', usSort = 'total';
@@ -259,13 +263,21 @@ function rateLimitMeta(row, now) {
       title: model + '\n模型当前不可用' + (deadline ? '\n最早重试：' + fmtLocalDateTime(deadline) : ''),
     };
   }
-  let detail = resetAt
-    ? '预计 ' + fmtLocalDateTime(resetAt) + ' 解封' + (remaining ? '（剩余 ' + dur(remaining) + '）' : '')
-    : (until ? '预计 ' + fmtLocalDateTime(until) + ' 恢复（剩余 ' + dur(remaining) + '）' : '预计解封时间未知');
   const title = [model, resetAt ? '上游重置：' + fmtLocalDateTime(resetAt) : '上游重置：时间未知'];
   if (until && resetAt && until < resetAt) {
-    detail += ' · 网关最快 ' + dur(Math.max(0, Math.round((until - now) / 1000))) + ' 后重试';
+    // 双时钟（issue #171 问题二）：黄框出现/消失由 until 决定（网关为防超长
+    // 限流拖死全池，把重试封顶在 now+softRateMax），主文字却按 resetAt 显示，
+    // 导致「写的解封时间」与「实际掉框时刻」不一致。此时主文字同时明示两个
+    // 时刻与口径，倒计时跟随 until（与实际掉框一致，也与「模型与档位」页
+    // 锁池表的 until 口径对齐）。
+    const retryIn = until > now ? Math.round((until - now) / 1000) : 0;
+    detail = '网关 ' + fmtLocalDateTime(until) + ' 起重试' + (retryIn ? '（剩余 ' + dur(retryIn) + '）' : '') +
+      ' · 上游称 ' + fmtLocalDateTime(resetAt) + ' 恢复';
     title.push('网关最早重试：' + fmtLocalDateTime(until));
+  } else {
+    detail = resetAt
+      ? '预计 ' + fmtLocalDateTime(resetAt) + ' 解封' + (remaining ? '（剩余 ' + dur(remaining) + '）' : '')
+      : (until ? '预计 ' + fmtLocalDateTime(until) + ' 恢复（剩余 ' + dur(remaining) + '）' : '预计解封时间未知');
   }
   return { model, kind, detail, title: title.join('\n') };
 }
@@ -423,7 +435,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -514,9 +526,11 @@ async function loadOverview(quiet) {
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
     renderAccounts(d.accounts || []);
     renderModelLocks(d.model_locks);
-    // 到期卡片跟随首页统计同步刷新（用同一份响应里的到期快照，不额外发请求）。
-    // 已有逐包明细缓存时不再覆盖——明细信息量更大，别把它降级成快照。
-    if ($('expBox') && !lastPackages) renderExpirySnapshot(d);
+    // 到期卡片跟随首页统计同步刷新（用同一份响应里的按日批次，不额外发请求）。
+    // 2 分钟内的实时明细最新且更全，保留；过期后由 state 快照接管，避免点过一次
+    // 「检查」之后卡片永远停在那一刻的旧数据。
+    const liveFresh = lastPackages && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
+    if ($('expBox') && !liveFresh) renderExpirySnapshot(d);
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
 
@@ -627,10 +641,18 @@ async function loadModels() {
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
-    // 探测数据是可选增强：拉取失败不影响模型列表本身
-    const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
+    // 探测、模型锁与最近请求都是本地可选增强：任一失败不影响模型目录本身。
+    // 可用性标签不额外发推理请求，只用模型锁和最近真实请求结果合成。
+    const [d, pr, st, rm] = await Promise.all([
+      api('models'),
+      api('model_probes').catch(() => ({})),
+      api('status').catch(() => ({})),
+      api('request_metrics').catch(() => ({})),
+    ]);
     mdAll = d.models || [];
     mdProbes = pr.probes || {};
+    mdLocks = Array.isArray(st.model_locks) ? st.model_locks : [];
+    mdRecent = Array.isArray(rm.recent) ? rm.recent : [];
     if (!mdAll.length) {
       tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>';
       $('mdCount').textContent = '';
@@ -707,6 +729,67 @@ function mdSortList(list, f) {
   return out;
 }
 
+// mdAvailabilityOf 合成 Global 模型当前可用性：模型锁优先于最近请求结果。
+// 只返回有真实本地证据的状态；目录中存在但从未请求过的模型标为“待验证”，
+// 避免把“上游列出了模型”误当成“当前账号有权限”。
+function mdAvailabilityOf(m, locks, recent) {
+  const id = String((m && m.id) || '');
+  if (!id.startsWith('global:')) return null;
+  locks = Array.isArray(locks) ? locks : mdLocks;
+  recent = Array.isArray(recent) ? recent : mdRecent;
+  const bare = id.slice('global:'.length);
+  const lock = locks.find(r => r && r.realm === 'global' && r.model === bare);
+  if (lock) {
+    const reason = String(lock.reason || '').trim();
+    const lower = reason.toLowerCase();
+    if (lock.state === 'partial') {
+      return { key: 'partial', label: '部分可用', cls: 'warn',
+        tip: '仍有 ' + Number(lock.servable || 0) + ' 个 global 账号可服务；已锁 ' + Number(lock.locked || 0) + ' 个' + (reason ? '；' + reason : '') };
+    }
+    if (lock.state === 'starved') {
+      return { key: 'starved', label: '账号暂不可用', cls: 'mute',
+        tip: '没有账号能服务该模型，但并非该模型自身被锁；请检查账号冷却/在途占用' };
+    }
+    if (lower.startsWith('11158') || lower.includes('not allowed for user type')) {
+      return { key: 'denied', label: '无权限', cls: 'bad',
+        tip: '当前 global 账号类型不支持该模型' + (reason ? '；' + reason : '') };
+    }
+    if (lower.startsWith('11102') || lower.includes('service info not found')) {
+      return { key: 'missing', label: '上游无此模型', cls: 'bad',
+        tip: '上游目录残留，实际请求返回模型不存在' + (reason ? '；' + reason : '') };
+    }
+    return { key: 'limited', label: '限流/不可用', cls: 'warn',
+      tip: '模型级冷却中' + (reason ? '；' + reason : '') };
+  }
+  const ev = recent.find(e => e && e.model === id);
+  if (ev) {
+    const status = Number(ev.status || 0);
+    const when = ev.time ? new Date(ev.time).toLocaleString('zh-CN', { hour12: false }) : '';
+    if (ev.outcome === 'success' || (status >= 200 && status < 300)) {
+      return { key: 'ok', label: '可用', cls: 'ok',
+        tip: '最近一次真实请求成功' + (when ? ' · ' + when : '') };
+    }
+    if (status === 429) {
+      return { key: 'rate', label: '限流', cls: 'warn',
+        tip: '最近一次请求被限流' + (when ? ' · ' + when : '') };
+    }
+    if (status >= 500) {
+      return { key: 'upstream', label: '上游错误', cls: 'bad',
+        tip: '最近一次请求上游错误 HTTP ' + status + (when ? ' · ' + when : '') };
+    }
+    return { key: 'failed', label: '最近失败', cls: 'bad',
+      tip: '最近一次请求失败 HTTP ' + (status || '—') + (when ? ' · ' + when : '') };
+  }
+  return { key: 'unknown', label: '待验证', cls: 'mute',
+    tip: '尚无模型锁或近期真实请求记录；目录存在不代表当前账号有权限' };
+}
+
+function mdAvailabilityTag(m) {
+  const av = mdAvailabilityOf(m);
+  if (!av) return '';
+  return ' <span class="tag ' + av.cls + ' md-avail" title="' + esc(av.tip) + '">' + esc(av.label) + '</span>';
+}
+
 // mdRowHtml 单个模型行（纯渲染，便于独立测试）。
 function mdRowHtml(m, pr) {
   const eff = (m.supported_efforts || []).slice();
@@ -721,7 +804,7 @@ function mdRowHtml(m, pr) {
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
   const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm"><span class="mid">' + esc(m.id) + '</span>' + mdAvailabilityTag(m) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
     '<td class="num">' + rateCell(m) + '</td>' +
     '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
     '<td class="efs" style="white-space:normal">' + effs + '</td>' +
@@ -1044,6 +1127,10 @@ $('btnLogPin').onclick = () => {
 
 /* ── 配置 ─────────────────────────────────────────────────────────── */
 const CFG_MAP = {
+  strategy_domestic: ['pool', 'strategy', 'domestic'],
+  strategy_international: ['pool', 'strategy', 'international'],
+  domestic_account_order: ['pool', 'account_order', 'domestic'],
+  international_account_order: ['pool', 'account_order', 'international'],
   listen: ['listen'], api_key: ['api_key'],
   package_detail_limit: ['panel', 'package_detail_limit'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'], growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
@@ -1051,6 +1138,7 @@ const CFG_MAP = {
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
+  task_sweep_enabled: ['schedule', 'task_sweep_enabled'], task_sweep_minutes: ['schedule', 'task_sweep_minutes'],
   include_disabled_in_tasks: ['schedule', 'include_disabled_in_tasks'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],
@@ -1102,7 +1190,7 @@ async function loadConfig() {
       const v = dig(cfgLoaded, path);
       if (el.type === 'checkbox') el.checked = !!v;
       else if (Array.isArray(v)) el.value = v.join(', ');
-      else el.value = v == null ? '' : v;
+      else el.value = v == null ? (name.startsWith('strategy_') ? 'weighted_random' : '') : v;
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
     $('cfgNote').textContent = '';
@@ -1119,7 +1207,8 @@ function collectConfig() {
     else {
       const raw = el.value.trim();
       // 覆盖型字段空串照发（见 CLEARABLE_CFG）；其余空 = 不下发。
-      if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
+      if (name.endsWith('_account_order')) v = raw.split(/[,，\s]+/).filter(Boolean);
+      else if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
       else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
       else v = raw;
     }
@@ -1291,10 +1380,183 @@ $('btnRefresh').onclick = async () => {
   if (view === 'logs') loadLogs();
 };
 
+/* ── 官方补偿（issue #189）─────────────────────────────────────────
+   「查状态 → 待领才领」。
+
+   取数与呈现刻意分开：
+     - 取数只有手动触发（进页面一次 + 「检查」/「领取」后）。补偿状态没有
+       overview 快照可吃，必须逐号打上游，挂进 5s 轮询就是每 5 秒轰炸上游。
+     - 呈现走 compCache 的本地重渲染（refreshVisible 每轮调一次），只为让
+       倒计时走动 —— 不发任何请求。
+   之前这里有个「5 分钟新鲜窗口」分支，但它唯一的非强制调用点是 start()，
+   而那里 compCache 必为 null，所以该分支永远不会命中：注释宣称「防轰炸」，
+   实际是「根本不刷新」。现已删除，别再加回来。
+
+   声明位置在本段（轮询区之前）是必需的：start() 会调用 loadCompensation()，
+   若这些 let 写在 start() 之后，顶层求值会在 TDZ 上炸——
+   TestAppJSTopLevelSmoke 正是为这类问题设的闸门。 */
+let compCache = null;
+let compInFlight = null;   // 在途请求的 promise（非布尔标志：布尔标志配 force 刷新会静默空转）
+
+// compPending 挑出「可领未领」的账号。
+// 纯函数：判据独立于渲染，node 侧单测单独钉住。
+// 判据与后端 upstream.CompensationStatus.Pending() 对齐——两端各留一份实现是
+// 有意为之（前端要在渲染前先算总数），但**必须同步**，改一处就要改另一处。
+function compPending(rows) {
+  return (rows || []).filter(r => r && !r.skip && !r.error && r.status &&
+    r.status.active && !r.status.claimed && (r.status.credit_num || 0) > 0);
+}
+
+// compErrored 挑出「查询失败」的账号。
+// 单独拎出来，是因为它们**必须显形**：上游 5xx / token 过期时所有账号都会落到
+// 这里，若和「没有补偿」一起被过滤掉，卡片就会整块消失，用户看到的是「什么都没有」
+// ——而真相是「一个都没查成」。这正是本 PR 要消灭的静默失败。
+function compErrored(rows) {
+  return (rows || []).filter(r => r && r.error);
+}
+
+// compTotalPending 待领总额。
+function compTotalPending(rows) {
+  return compPending(rows).reduce((s, r) => s + (r.status.credit_num || 0), 0);
+}
+
+// compDeadlineText 领取截止倒计时文案。
+// 上游 end_time 形如 "2026-10-22 23:59:59" 且**不带时区**，按浏览器本地时区解析
+// （与后端积分到期的处理同口径）。urgent=true 表示距截止 <=48h，前端据此染色告警。
+function compDeadlineText(endTime, now) {
+  const raw = String(endTime == null ? '' : endTime).trim();
+  if (!raw) return { text: '无截止信息', urgent: false };
+  const t = new Date(raw.replace(' ', 'T')).getTime();
+  if (!isFinite(t)) return { text: raw, urgent: false };
+  const ms = t - (now || Date.now());
+  if (ms <= 0) return { text: '已截止', urgent: true };
+  const d = Math.floor(ms / 86400000);
+  const h = Math.floor(ms % 86400000 / 3600000);
+  const text = d > 0 ? (d + ' 天 ' + h + ' 小时') : (Math.max(1, h) + ' 小时');
+  return { text: '剩 ' + text, urgent: ms <= 2 * 86400000 };
+}
+
+function renderCompensation(d) {
+  const rows = (d && d.accounts) || [];
+  const box = $('compBox');
+  if (!box) return;
+  const active = rows.filter(r => r && !r.error && r.status && r.status.active);
+  const failed = compErrored(rows);
+  // 「有失败就必须显形」——哪怕一条有效数据都没有。
+  if (!active.length && !failed.length) { box.hidden = true; return; }
+  box.hidden = false;
+
+  const now = Date.now();
+  const okRows = active.map(r => {
+    const s = r.status || {};
+    const done = !!s.claimed;
+    const dl = compDeadlineText(s.end_time, now);
+    const name = esc(r.nickname || String(r.uid).slice(0, 8));
+    return '<div class="comp-row"><span>' + name + '</span>' +
+      (done
+        ? '<span class="tag ok">已领取</span>'
+        : '<span class="tag warn">待领取</span>' +
+          '<span class="tag' + (dl.urgent ? ' bad' : ' mute') + '">' + esc(dl.text) + '</span>') +
+      '<span class="tag mute">' + esc(fmtTok(s.credit_num || 0)) + ' 积分</span>' +
+      (done ? '' : '<button class="xs" data-comp-uid="' + esc(r.uid) + '">领取</button>') +
+      '</div>';
+  }).join('');
+  // err 文本来自上游响应体，是外部可控字符串，必须 esc。
+  const errRows = failed.map(r =>
+    '<div class="comp-row"><span>' + esc(r.nickname || String(r.uid).slice(0, 8)) + '</span>' +
+    '<span class="tag bad">查询失败</span>' +
+    '<span class="tag mute">' + esc(String(r.error).slice(0, 120)) + '</span></div>'
+  ).join('');
+
+  $('compList').innerHTML = okRows + errRows;
+
+  const n = compPending(rows).length;
+  let note = n ? (n + ' 个账号待领 · 共 ' + fmtTok(compTotalPending(rows)) + ' 积分') : '当前无待领补偿';
+  // 混合态下也要把失败数说出来，否则 note 仍读作「没事」。
+  if (failed.length) note += ' · ' + failed.length + ' 个账号查询失败';
+  $('compNote').textContent = note;
+}
+
+// renderCachedCompensation 从缓存重渲染（不发请求），让倒计时走动。
+// 由 refreshVisible 每轮调用；无缓存（还没查过）时什么都不做。
+function renderCachedCompensation() {
+  if (compCache) renderCompensation(compCache);
+}
+
+async function loadCompensation() {
+  // 已有在途请求就等它跑完，而不是静默返回——领取后紧接着的刷新必须能看到新状态，
+  // 否则用户点了「领取」但列表纹丝不动。
+  if (compInFlight) { await compInFlight; return; }
+  compInFlight = (async () => {
+    try {
+      const d = await api('compensation');
+      compCache = d;
+      renderCompensation(d);
+    } catch (e) {
+      const box = $('compBox');
+      if (box) box.hidden = false;
+      if ($('compList')) $('compList').innerHTML =
+        '<div class="empty">查询失败：' + esc(e.message) + '</div>';
+      if ($('compNote')) $('compNote').textContent = '';
+    }
+  })();
+  try {
+    await compInFlight;
+  } finally {
+    compInFlight = null;   // 必须 finally：否则一次异常就让此后所有刷新永久失效
+  }
+}
+
+// 领取按钮走事件委托：列表每次重渲染都整块换 innerHTML，绑在具体节点上必丢。
+if ($('compList')) $('compList').addEventListener('click', async e => {
+  const b = e.target.closest('[data-comp-uid]');
+  if (!b) return;
+  b.disabled = true;
+  try {
+    const r = await api('accounts/' + encodeURIComponent(b.dataset.compUid) + '/compensation', { method: 'POST' });
+    const res = r.result || {};
+    if (res.claimed) toast('已领取 ' + fmtTok(res.credit || 0) + ' 积分', 'ok');
+    else if (res.error) toast('查询失败，未能确认是否有补偿', 'err');
+    else if (res.skip) toast(res.skip_msg || '无需领取', '');
+    else toast('领取失败：未知结果', 'err');
+    await loadCompensation();
+    loadOverview(true);
+  } catch (err) {
+    toast('领取失败：' + err.message, 'err');
+  }
+});
+
+if ($('btnCompRefresh')) $('btnCompRefresh').onclick = () => loadCompensation();
+
+if ($('btnCompClaimAll')) $('btnCompClaimAll').onclick = async () => {
+  const b = $('btnCompClaimAll');
+  b.disabled = true;
+  try {
+    const r = await api('compensation_all', { method: 'POST' });
+    const s = r.summary || {};
+    // 顺序要紧：先看有没有账号没拿到结论，再看有没有领到。
+    // 只按 claimed 判定的话，「全部查询失败」会被说成「当前没有待领补偿」，
+    // 把故障说成了「没活动」——比不说更糟。
+    if (s.errored) {
+      toast(s.errored + ' 个账号查询失败，未能确认是否有补偿', 'err');
+    } else if (s.claimed) {
+      toast('已领取 ' + s.claimed + ' 个账号，共 ' + fmtTok(s.credit || 0) + ' 积分', 'ok');
+    } else {
+      toast('当前没有待领补偿', '');
+    }
+    await loadCompensation();
+    loadOverview(true);
+  } catch (e) {
+    toast('领取失败：' + e.message, 'err');
+  } finally {
+    b.disabled = false;
+  }
+};
+
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
 let lastLogsAt = 0;
 function refreshVisible() {
-  if (view === 'accounts') loadOverview(true);
+  if (view === 'accounts') { loadOverview(true); renderCachedCompensation(); }
   else if (view === 'logs') {
     // 日志视图降频到 15 秒：loadLogs 一次并发拉 4 个接口（logs / metrics /
     // request_logs / credit_history），5 秒轮询对"看日志"这个场景毫无必要，
@@ -1306,6 +1568,7 @@ function refreshVisible() {
 }
 function start() {
   loadOverview(true);
+  loadCompensation();                       // 补偿状态：首次进页面查一次（之后靠新鲜窗口）
   if (refTimer) clearInterval(refTimer);
   refTimer = setInterval(refreshVisible, 5000);
   checkAuthGate();
@@ -1947,10 +2210,12 @@ function usPct(part, total) {
 
 /* usRow 生成一行。mid 是插在「名称」之后、请求数之前的额外单元格（如「域」列）。
    withPerf 控制延迟/速率两列；列开关显式传入，避免调用方改动后与表头错列。 */
-function usRow(name, sub, a, mid, withPerf) {
+/* nameHtml 非空时替代 esc(name)（已转义的富文本，见 remarkName）：账号维度的第一列
+   需要把备注渲染成主标识、uid8 作为浅色虚体跟随，其余维度仍走纯文本转义。 */
+function usRow(name, sub, a, mid, withPerf, nameHtml) {
   return '<tr>' +
     '<td class="mark" aria-hidden="true"></td>' +
-    '<td>' + esc(name) + (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
+    '<td>' + (nameHtml || esc(name)) + (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
     (mid || '') +
     '<td class="num">' + fmtTok(a.requests) + '</td>' +
     '<td class="num">' + (a.errors ? '<span style="color:var(--warn)">' + fmtTok(a.errors) + '</span>' : '—') + '</td>' +
@@ -2018,13 +2283,16 @@ function renderUsageDim() {
     realm: (d.by_realm || []).length,
   });
   $('usDimHead').innerHTML = usDimHead(usDim);
-  $('usDimBody').innerHTML = rows.map(x =>
-    usRow(usDim === 'account' ? String(x.key || '').slice(0, 8) : x.key,
-      usDim === 'account' ? (x.extra || '') : '',
+  $('usDimBody').innerHTML = rows.map(x => {
+    const isAcct = usDim === 'account';
+    const key = isAcct ? String(x.key || '').slice(0, 8) : x.key;
+    return usRow(key,
+      isAcct ? (x.extra || '') : '',
       x,
-      usDim === 'account' ? '<td class="num">' + esc(x.realm || '') + '</td>' : '',
-      m.withPerf)
-  ).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>';
+      isAcct ? '<td class="num">' + esc(x.realm || '') + '</td>' : '',
+      m.withPerf,
+      isAcct ? remarkName(x.key, esc(key)) : '');
+  }).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>';
   $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
 }
 
@@ -2075,7 +2343,7 @@ function renderCreditDim() {
       const account = row.nickname || uid.slice(0, 8) || '—';
       return '<tr>' +
         '<td class="mark" aria-hidden="true"></td>' +
-        '<td>' + esc(account) + '<div class="note">' + esc(row.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>' +
+        '<td>' + remarkName(uid, esc(account)) + '<div class="note">' + esc(row.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>' +
         '<td class="num">' + fmtTok(row.requests) + '</td>' +
         '<td class="num">' + fmtCredit(row.credits) + '</td>' +
         '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
@@ -2970,8 +3238,11 @@ function expDaysLeft(dateStr, today) {
   return Math.round((new Date(dateStr + 'T00:00:00') - today) / 86400000);
 }
 
-function renderExpiry(d) {
-  const list = (d.accounts || []);
+// expiryRowsHtml 到期提醒的逐账号行渲染。**「检查」与首页快照共用这一个函数**，
+// 保证两条数据路径（逐包明细 / state 里的按日批次）输出完全一致：排序、今天/明天
+// 文案、日均需耗、7 天内合计、随后批次都只有一份实现。
+// list 每项形态：{ uid, nickname, packages:[{end_time, remain}], error? }。
+function expiryRowsHtml(list) {
   const today = new Date(); today.setHours(0, 0, 0, 0);
   // 按「最近到期」升序排（issue #125）。
   //
@@ -2991,21 +3262,29 @@ function renderExpiry(d) {
     return { a, key };
   });
   keyed.sort((x, y) => {
-    if (x.key === y.key) return 0;
-    if (x.key === null) return 1;
-    if (y.key === null) return -1;
-    return x.key < y.key ? -1 : 1;
+    if (x.key !== y.key) {
+      if (x.key === null) return 1;
+      if (y.key === null) return -1;
+      return x.key < y.key ? -1 : 1;
+    }
+    if (x.key === null) return 0;
+    // 同日到期的账号按昵称/uid 兜底排序：两条数据路径（检查的余额降序、
+    // overview 的 uid 升序）输入顺序不同，加固定 tie-break 才能保证输出一致。
+    const ax = String(x.a.nickname || x.a.uid || '');
+    const ay = String(y.a.nickname || y.a.uid || '');
+    return ax < ay ? -1 : ax > ay ? 1 : 0;
   });
-  const rows = keyed.map(({ a }) => {
+  return keyed.map(({ a }) => {
+    const name = a.nickname || String(a.uid || '').slice(0, 8);
     if (a.error) {
       return '<div class="exp-row"><span class="exp-dot" style="background:var(--ink-3)"></span>' +
-        '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
+        '<span class="exp-nm">' + esc(name) + '</span>' +
         '<span class="exp-main err">查询失败：' + esc(a.error) + '</span></div>';
     }
     const bs = expBatches(a.packages).filter(b => expDaysLeft(b.date, today) >= 0);
     if (!bs.length) {
       return '<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
-        '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
+        '<span class="exp-nm">' + esc(name) + '</span>' +
         '<span class="exp-main">7 天内无到期积分</span></div>';
     }
     const first = bs[0];
@@ -3022,7 +3301,7 @@ function renderExpiry(d) {
     const rest = bs.slice(1, 4).map(b =>
       '随后 ' + esc(b.date.slice(5)) + ' · ' + fmtTok(b.remain)).join('　') + more;
     return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
-      '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
+      '<span class="exp-nm">' + esc(name) + '</span>' +
       '<span class="exp-main">最近到期 <b>' + esc(first.date) + '</b>（' + dayWord +
       '）· 该批 <b>' + fmtTok(first.remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
       fmtTok(daily) + '</b>' +
@@ -3030,6 +3309,11 @@ function renderExpiry(d) {
       (rest ? '<div class="note">' + rest + '</div>' : '') +
       '</span></div>';
   }).join('');
+}
+
+function renderExpiry(d) {
+  const list = (d.accounts || []);
+  const rows = expiryRowsHtml(list);
   $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
   // 数据新鲜度透明化：走缓存时标注年龄，免得把旧数据误当实时。
   const ageMin = lastPackages ? Math.floor((Date.now() - lastPackagesAt) / 60000) : 0;
@@ -3039,15 +3323,47 @@ function renderExpiry(d) {
   $('expBox').hidden = false;
 }
 
-/* 快照版到期提醒：不查上游，直接用 /overview 已有的 credits_earliest_expiry /
-   credits_earliest_remaining（由签到与余额后台刷新写入 state.json，默认每 5 分钟
-   更新一次）。打开面板即可看到「最近哪批要过期」，成本与首页统计条相同为零。
+/* 快照版到期提醒：不查上游，直接用 /overview 里的 credits_expiry_buckets。
+   后端每次余额刷新（默认每 5 分钟）按自然日聚合并写入 state.json，口径与
+   「检查」的逐包按日汇总完全相同；这里把批次还原成 packages 形态后直接复用
+   expiryRowsHtml，因此排序/今天明天/日均需耗/7 天内合计/随后批次全部一致。
 
-   与 renderExpiry（逐包明细版）的差异：这里只有**最早一批**的日期与数量，没有
-   后续批次、也没法算「7 天内合计」——那是 packages 接口才有的信息。因此卡片上
-   保留「检查」按钮作为增强入口，用户想要完整明细再显式触发一次上游查询。 */
+   旧 state（升级后尚未跑过一轮余额刷新，或 Redis 快照来自旧版本）没有 buckets，
+   退回只显示最早一批，保证卡片不空白；下一轮刷新后自动变成完整视图。 */
 function renderExpirySnapshot(d) {
   const list = (d && d.accounts) || [];
+  const hasBuckets = list.some(a => Array.isArray(a.credits_expiry_buckets) && a.credits_expiry_buckets.length);
+  if (hasBuckets) {
+    const isoDay = v => {
+      const dt = new Date(v);
+      if (isNaN(dt.getTime())) return '';
+      const p2 = n => String(n).padStart(2, '0');
+      return dt.getFullYear() + '-' + p2(dt.getMonth() + 1) + '-' + p2(dt.getDate());
+    };
+    // 逐账号取批次；升级过渡期/单号刷新失败的账号可能还没有 buckets，用旧的
+    // 「最早一批」字段兜底，避免在同一次渲染里被误报成「无到期」。
+    const packagesOf = a => {
+      const bs = a.credits_expiry_buckets || [];
+      if (bs.length) {
+        return bs.map(b => ({ end_time: (b.date || '') + 'T00:00:00', remain: b.remain }));
+      }
+      const day = isoDay(a.credits_earliest_expiry);
+      return (day && a.credits_earliest_remaining)
+        ? [{ end_time: day + 'T00:00:00', remain: a.credits_earliest_remaining }]
+        : [];
+    };
+    renderExpiry({
+      accounts: list.map(a => ({
+        uid: a.uid,
+        nickname: a.nickname,
+        realm: a.realm,
+        packages: packagesOf(a),
+      })),
+    });
+    $('expNote').textContent = snapshotNoteText(list.length, d);
+    return;
+  }
+  // 旧 state 兜底：只有最早一批的日期与数量。
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const keyed = list.map(a => {
     // 后端给的是 RFC3339 带时区；无到期信息（长期包/未刷新）的账号排在最后。
@@ -3071,12 +3387,16 @@ function renderExpirySnapshot(d) {
         '<span class="exp-nm">' + nm + '</span>' +
         '<span class="exp-main">无近期到期批次</span></div>';
     }
-    const days = Math.max(0, Math.ceil((ms - today.getTime()) / 86400000));
+    // 与 expDaysLeft 同口径：按本地自然日算，而不是对精确时间戳 ceil（后者会把
+    // 明天/今天各多算一天，日均需耗也随之少一半）。
+    const dt = new Date(ms);
+    const p2 = n => String(n).padStart(2, '0');
+    const when = dt.getFullYear() + '-' + p2(dt.getMonth() + 1) + '-' + p2(dt.getDate());
+    const days = Math.max(0, Math.round((new Date(when + 'T00:00:00') - today) / 86400000));
     const remain = Number(a.credits_earliest_remaining || 0);
     const daily = Math.ceil(remain / Math.max(1, days));
     const cls = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
     const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
-    const when = new Date(ms).toISOString().slice(0, 10);
     return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
       '<span class="exp-nm">' + nm + '</span>' +
       '<span class="exp-main">最近到期 <b>' + esc(when) + '</b>（' + dayWord +
@@ -3086,8 +3406,27 @@ function renderExpirySnapshot(d) {
       '</span></div>';
   }).join('');
   $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
-  $('expNote').textContent = list.length + ' 个账号 · 快照（来自本地状态，点「检查」拉实时明细）';
+  $('expNote').textContent = snapshotNoteText(list.length, d);
   $('expBox').hidden = false;
+}
+
+// snapshotNoteText 快照卡片的数据新鲜度标注。界面本身 5 秒轮询一次，但卡片数据
+// 只随余额后台刷新更新（默认每 5 分钟）——不标出来的话，5 秒级的界面刷新会让人
+// 误以为数据也是 5 秒级新鲜。放在 renderExpirySnapshot 之后：前端 harness 按
+// 「renderExpirySnapshot 起」切片求值，函数声明提升让它在同一切片内可用。
+function snapshotNoteText(count, d) {
+  const iv = Number(d && d.balance_refresh_sec) || 0;
+  const at = d && d.balance_refreshed_at ? new Date(d.balance_refreshed_at).getTime() : 0;
+  if (iv <= 0) {
+    return count + ' 个账号 · 快照（来自本地状态 · 未开启后台刷新，点「检查」拉实时明细）';
+  }
+  const every = iv % 60 === 0 ? iv / 60 + ' 分钟' : iv + ' 秒';
+  let tail = '每 ' + every + '后台刷新';
+  if (at && !isNaN(at)) {
+    const min = Math.floor((Date.now() - at) / 60000);
+    tail += '，' + (min < 1 ? '刚刚更新' : min + ' 分钟前更新');
+  }
+  return count + ' 个账号 · 快照（' + tail + '，点「检查」拉实时明细）';
 }
 
 async function loadExpiry(force) {
@@ -3114,3 +3453,91 @@ if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);
 
 // 「刷新」始终实时查（显式 force，不依赖事件对象真值）
 if ($('btnPk')) $('btnPk').onclick = () => loadPackages(true);
+
+/* ══ 账号备注（只写本机 localStorage；账号池 / 用量两个视图共用同一份映射）══════
+   键取 uid 前 8 位——与 renderUsageDim 账号维度的 key 和积分扣除表的 uid 前缀同源，
+   三个表格因此都能直接 join。展示层只替换文本并挂 .rm-ghost 虚体，账号标识本身
+   仍由服务端下发，不写回后端；备注是纯展示层信息，不参与选号 / 计费 / 鉴权。 */
+function remarksAll() {
+  if (remarksCache) return remarksCache;
+  try { remarksCache = JSON.parse(localStorage.getItem(LS_REMARKS)) || {}; }
+  catch (e) { remarksCache = {}; }
+  return remarksCache;
+}
+function remarkKey(uid) { return String(uid == null ? '' : uid).slice(0, 8); }
+function remarkOf(uid) {
+  const k = remarkKey(uid);
+  return k ? String(remarksAll()[k] || '') : '';
+}
+/* nameHtml 必须是已转义的 HTML；有备注时返回「备注 + 原标识（浅色虚体）」 */
+function remarkName(uid, nameHtml) {
+  const r = remarkOf(uid);
+  return r ? esc(r) + '<span class="rm-ghost">' + nameHtml + '</span>' : nameHtml;
+}
+function storeRemarks(map) {
+  remarksCache = map;
+  try { localStorage.setItem(LS_REMARKS, JSON.stringify(map)); } catch (e) {}
+}
+
+/* 编辑器的行来自 overview 缓存（账号池加载过就有），另外补上「已有备注但当前列表里
+   没有」的键，避免账号被移除后备注看起来凭空消失。 */
+function remarkFormRows() {
+  const rows = ((overviewData && overviewData.accounts) || [])
+    .map(s => ({ uid: remarkKey(s.uid), who: s.nickname || remarkKey(s.uid) }))
+    .filter(r => r.uid);
+  for (const k of Object.keys(remarksAll())) {
+    if (!rows.some(r => r.uid === k)) rows.push({ uid: k, who: k });
+  }
+  return rows;
+}
+function renderRemarkBody() {
+  const box = $('remarkBody');
+  if (!box) return;
+  const rows = remarkFormRows();
+  box.innerHTML = rows.length
+    ? rows.map(r => '<div class="rm-row"><span class="rm-who" title="' + esc(r.who) + '">' + esc(r.who) + '</span>' +
+        '<input type="text" data-uid="' + esc(r.uid) + '" value="' + esc(remarksAll()[r.uid] || '') + '" placeholder="备注（留空即清除）" maxlength="24"></div>').join('')
+    : '<div class="empty">暂无账号：先在「账号池」加载一次账号列表。</div>';
+}
+function openRemarks() {
+  renderRemarkBody();
+  if ($('remarkVeil')) $('remarkVeil').classList.add('on');
+}
+function closeRemarks() { if ($('remarkVeil')) $('remarkVeil').classList.remove('on'); }
+function saveRemarkForm() {
+  const map = {};
+  document.querySelectorAll('#remarkBody input[data-uid]').forEach(inp => {
+    const v = inp.value.trim();
+    if (v) map[inp.getAttribute('data-uid')] = v;
+  });
+  storeRemarks(map);
+  closeRemarks();
+  // 备注只影响本机展示：重渲染当前视图即可，无需后端参与。
+  if (view === 'accounts') loadOverview(true);
+  else if (view === 'usage' && usageData) renderUsage(usageData);
+  toast('备注已保存（仅本机浏览器）');
+}
+if ($('btnRemarks')) $('btnRemarks').onclick = openRemarks;
+if ($('btnRemarkClose')) $('btnRemarkClose').onclick = closeRemarks;
+if ($('btnRemarkClear')) $('btnRemarkClear').onclick = () => { storeRemarks({}); renderRemarkBody(); };
+if ($('btnRemarkSave')) $('btnRemarkSave').onclick = saveRemarkForm;
+
+/* ══ 首页「积分到期提醒」折叠（选择记在本机，默认展开）═════════════════════
+   展开态是原行为：点「检查」就要能立刻看到结果，所以默认不折叠；用户收起一次后
+   由 localStorage 记住。折叠只作用于列表容器，卡片标题与「检查」按钮始终可见。 */
+function expFolded() { return localStorage.getItem(LS_EXP_FOLD) === '1'; }
+function applyExpFold() {
+  const pad = $('expPad'), btn = $('btnExpFold');
+  if (!pad || !btn) return;
+  const folded = expFolded();
+  pad.hidden = folded;
+  btn.textContent = folded ? '展开' : '收起';
+  btn.setAttribute('aria-expanded', folded ? 'false' : 'true');
+}
+if ($('btnExpFold')) {
+  $('btnExpFold').onclick = () => {
+    try { localStorage.setItem(LS_EXP_FOLD, expFolded() ? '0' : '1'); } catch (e) {}
+    applyExpFold();
+  };
+}
+applyExpFold();
