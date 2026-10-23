@@ -34,25 +34,45 @@ if ! git remote get-url upstream >/dev/null 2>&1; then
   git remote add upstream "$UPSTREAM_URL"
 fi
 
-# 2) 工作区必须干净：合并期间混进未提交改动最难排查
-if [ -n "$(git status --porcelain)" ]; then
+# 2) 工作区必须干净：合并期间混进未提交改动最难排查。
+#    --check 是纯只读探针（哨兵每天跑），不受此限。
+if [ "$CHECK_ONLY" -eq 0 ] && [ -n "$(git status --porcelain)" ]; then
   echo "✗ 工作区有未提交改动，先 commit 或 stash 再同步：" >&2
   git status --short >&2
   exit 1
 fi
 
-# 3) 拉取上游
+# 3) 拉取上游。git 协议在国内链路上会被重置（RPC failed / curl 28 /
+#    expected flush after ref listing），而 GitHub API 往往还能通，
+#    所以 fetch 失败时回落到 API 只读核对——哨兵要在半通网络下也能给出结论。
 echo "→ 拉取上游 ..."
-git fetch upstream --prune --quiet
-BEHIND=$(git rev-list --count "HEAD..upstream/$BRANCH")
-if [ "$BEHIND" -eq 0 ]; then
-  echo "✓ 已是最新：HEAD 已包含 upstream/$BRANCH 的全部提交"
-  exit 0
-fi
+if git fetch upstream --prune --quiet 2>/dev/null; then
+  BEHIND=$(git rev-list --count "HEAD..upstream/$BRANCH")
+  if [ "$BEHIND" -eq 0 ]; then
+    echo "✓ 已是最新：HEAD 已包含 upstream/$BRANCH 的全部提交"
+    exit 0
+  fi
 
-echo "→ 上游有 $BEHIND 个新提交："
-git log --oneline --no-decorate "HEAD..upstream/$BRANCH"
-echo
+  echo "→ 上游有 $BEHIND 个新提交："
+  git log --oneline --no-decorate "HEAD..upstream/$BRANCH"
+  echo
+else
+  echo "⚠ git fetch 失败（链路问题），改用 GitHub API 核对 ..."
+  UP_SHA=$(gh api "repos/linguo2625469/workbuddy2api-panel/commits/$BRANCH" --jq '.sha' 2>/dev/null || true)
+  if [ -z "$UP_SHA" ]; then
+    echo "✗ git fetch 与 GitHub API 均不可用，本次无法判断上游状态" >&2
+    exit 1
+  fi
+  UP_DATE=$(gh api "repos/linguo2625469/workbuddy2api-panel/commits/$BRANCH" --jq '.commit.committer.date' 2>/dev/null || echo "未知")
+  echo "  上游 HEAD: ${UP_SHA:0:8}  ($UP_DATE)"
+  if git cat-file -e "$UP_SHA" 2>/dev/null; then
+    echo "✓ 已是最新：上游 HEAD 已在本地对象库中（API 核对）"
+    exit 0
+  fi
+  echo "✗ 上游有新提交，但 git 协议不通，无法自动拉取：$UP_SHA" >&2
+  echo "   可试：git config http.version HTTP/1.1 后重跑，或用 bundle 离线同步" >&2
+  exit 1
+fi
 
 # 上游的新 PR 也是潜在的"更新"（本仓库当初就是靠并入 PR 起步的）
 if command -v gh >/dev/null 2>&1; then
